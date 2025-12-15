@@ -4,7 +4,6 @@
 [![Documentation](https://docs.rs/s-zip/badge.svg)](https://docs.rs/s-zip)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-# s-zip
 ```text
 ███████╗      ███████╗██╗██████╗ 
 ██╔════╝      ╚══███╔╝██║██╔══██╗
