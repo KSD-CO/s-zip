@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 # s-zip
+<div align="center">
 ```text
 ███████╗      ███████╗██╗██████╗ 
 ██╔════╝      ╚══███╔╝██║██╔══██╗
@@ -13,7 +14,7 @@
 ███████║      ███████╗██║██║     
 ╚══════╝      ╚══════╝╚═╝╚═╝     
 ```
-
+</div>
 `s-zip` is a streaming ZIP reader and writer designed for backend systems that need
 to process large archives with minimal memory usage.
 
