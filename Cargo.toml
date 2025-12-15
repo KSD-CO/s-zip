@@ -1,0 +1,18 @@
+[package]
+name = "s-zip"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ton That Vu <ttvuhm@gmail.com>"]
+description = "High-performance streaming ZIP library - Read/write ZIP files with minimal memory footprint"
+license = "MIT"
+repository = "https://github.com/KSD-CO/s-zip"
+keywords = ["zip", "streaming", "compression", "deflate", "archive"]
+categories = ["compression", "encoding", "filesystem"]
+readme = "README.md"
+
+[dependencies]
+flate2 = "1.0"
+crc32fast = "1.4"
+
+[dev-dependencies]
+tempfile = "3.8"
