@@ -49,6 +49,12 @@ Most ZIP libraries assume small files or in-memory buffers.
 - Data pipelines and batch jobs
 - Infrastructure tools that require ZIP as an intermediate format
 
+## Performance
+
+- **Memory**: ~2-5 MB constant usage regardless of ZIP size
+- **Speed**: Comparable to `zip` crate for common operations
+- **No temp files**: Direct streaming compression saves disk I/O
+
 ## Quick Start
 
 Add this to your `Cargo.toml`:
