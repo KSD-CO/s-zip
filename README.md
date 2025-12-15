@@ -4,16 +4,53 @@
 [![Documentation](https://docs.rs/s-zip/badge.svg)](https://docs.rs/s-zip)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-High-performance streaming ZIP library for Rust - Read/write ZIP files with minimal memory footprint.
+# s-zip
 
-## Features
+███████╗      ███████╗██╗██████╗ 
+██╔════╝      ╚══███╔╝██║██╔══██╗
+███████╗█████╗  ███╔╝ ██║██████╔╝
+╚════██║╚════╝ ███╔╝  ██║██╔═══╝ 
+███████║      ███████╗██║██║     
+╚══════╝      ╚══════╝╚═╝╚═╝     
 
-- 🚀 **Streaming Read**: Extract files from ZIP archives without loading entire archive into memory
-- ✍️ **Streaming Write**: Create ZIP files with on-the-fly compression, no temp files needed
-- 💾 **Low Memory**: Constant memory usage regardless of ZIP file size
-- ⚡ **Fast**: Optimized for performance with minimal allocations
-- 🎯 **Simple API**: Easy to use, intuitive interface
-- 📦 **No Dependencies**: Only uses `flate2` and `crc32fast`
+s-zip — streaming-first compression
+
+`s-zip` is a streaming ZIP reader and writer designed for backend systems that need
+to process large archives with minimal memory usage.
+
+The focus is not on end-user tooling, but on providing a reliable ZIP building block
+for servers, batch jobs, and data pipelines.
+
+## Why s-zip?
+
+Most ZIP libraries assume small files or in-memory buffers.
+`s-zip` is built around streaming from day one.
+
+- Constant memory usage
+- Suitable for very large files
+- Works well in containers and memory-constrained environments
+- Designed for backend and data-processing workloads
+
+## Key Features
+
+- Streaming ZIP writer (no full buffering)
+- Streaming ZIP reader
+- Predictable memory usage
+- Rust safety guarantees
+- Backend-friendly API
+
+## Non-goals
+
+- Not a CLI replacement for zip/unzip
+- Not focused on desktop or interactive usage
+- Not optimized for small files convenience
+
+## Typical Use Cases
+
+- Generating large ZIP exports on the server
+- Packaging reports or datasets
+- Data pipelines and batch jobs
+- Infrastructure tools that require ZIP as an intermediate format
 
 ## Quick Start
 
@@ -82,41 +119,6 @@ let mut writer = StreamingZipWriter::with_compression("output.zip", 9)?; // Max 
 writer.finish()?;
 ```
 
-## Why s-zip?
-
-Most ZIP libraries in Rust either:
-- Load entire files into memory (high memory usage)
-- Require temp files for compression (slow, disk I/O)
-- Have complex APIs with many features you don't need
-
-**s-zip** focuses on:
-- Streaming operations (read/write on-the-fly)
-- Minimal memory footprint (constant memory usage)
-- Simple, easy-to-use API
-- Good performance for common use cases
-
-Perfect for:
-- Processing large ZIP archives
-- Creating ZIP files from streaming data
-- Memory-constrained environments
-- High-performance data pipelines
-
-## Performance
-
-- **Memory**: ~2-5 MB constant usage regardless of ZIP size
-- **Speed**: Comparable to `zip` crate for common operations
-- **No temp files**: Direct streaming compression saves disk I/O
-
-## Limitations
-
-- Only supports DEFLATE compression (most common)
-- No encryption support
-- Write operations require `finish()` call
-
-## Changelog
-
-- v0.1.1: Added ZIP64 read/write support for large archives (>4GB) and improved compatibility with external unzip tools.
-
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.
@@ -125,10 +127,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## Related Projects
-
-- [excelstream](https://github.com/KSD-CO/excelstream) - High-performance Excel library using s-zip
-- [zip](https://crates.io/crates/zip) - Full-featured ZIP library
 
 ## Author
 
