@@ -21,7 +21,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-s-zip = "0.1"
+s-zip = "0.1.1"
 ```
 
 ### Reading a ZIP file
@@ -110,9 +110,12 @@ Perfect for:
 ## Limitations
 
 - Only supports DEFLATE compression (most common)
-- No ZIP64 support (max 4GB files) - coming soon
 - No encryption support
 - Write operations require `finish()` call
+
+## Changelog
+
+- v0.1.1: Added ZIP64 read/write support for large archives (>4GB) and improved compatibility with external unzip tools.
 
 ## License
 
