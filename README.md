@@ -5,14 +5,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 # s-zip
-
+```text
 ███████╗      ███████╗██╗██████╗ 
 ██╔════╝      ╚══███╔╝██║██╔══██╗
 ███████╗█████╗  ███╔╝ ██║██████╔╝
 ╚════██║╚════╝ ███╔╝  ██║██╔═══╝ 
 ███████║      ███████╗██║██║     
 ╚══════╝      ╚══════╝╚═╝╚═╝     
-
+```
 s-zip — streaming-first compression
 
 `s-zip` is a streaming ZIP reader and writer designed for backend systems that need
