@@ -1,6 +1,6 @@
 [package]
 name = "s-zip"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 authors = ["Ton That Vu <ttvuhm@gmail.com>"]
 description = "High-performance streaming ZIP library - Read/write ZIP files with minimal memory footprint"
@@ -13,6 +13,24 @@ readme = "README.md"
 [dependencies]
 flate2 = "1.0"
 crc32fast = "1.4"
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tempfile = "3.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+default = []
+zstd-support = ["zstd"]
+
+[[bench]]
+name = "compression_bench"
+harness = false
+
+[[bench]]
+name = "read_bench"
+harness = false
+
+[[bench]]
+name = "file_size_analysis"
+harness = false

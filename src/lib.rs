@@ -54,4 +54,4 @@ pub mod writer;
 
 pub use error::{Result, SZipError};
 pub use reader::{StreamingZipReader, ZipEntry};
-pub use writer::StreamingZipWriter;
+pub use writer::{CompressionMethod, StreamingZipWriter};

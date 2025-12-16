@@ -15,6 +15,29 @@ use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::Path;
 
+/// Compression method to use for ZIP entries
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionMethod {
+    /// No compression (stored)
+    Stored,
+    /// DEFLATE compression (most common)
+    Deflate,
+    /// Zstd compression (requires zstd-support feature)
+    #[cfg(feature = "zstd-support")]
+    Zstd,
+}
+
+impl CompressionMethod {
+    fn to_zip_method(self) -> u16 {
+        match self {
+            CompressionMethod::Stored => 0,
+            CompressionMethod::Deflate => 8,
+            #[cfg(feature = "zstd-support")]
+            CompressionMethod::Zstd => 93,
+        }
+    }
+}
+
 /// Entry being written to ZIP
 struct ZipEntry {
     name: String,
@@ -22,6 +45,7 @@ struct ZipEntry {
     crc32: u32,
     compressed_size: u64,
     uncompressed_size: u64,
+    compression_method: u16,
 }
 
 /// Streaming ZIP writer that compresses data on-the-fly
@@ -30,12 +54,70 @@ pub struct StreamingZipWriter {
     entries: Vec<ZipEntry>,
     current_entry: Option<CurrentEntry>,
     compression_level: u32,
+    compression_method: CompressionMethod,
 }
 
 struct CurrentEntry {
     name: String,
     local_header_offset: u64,
+    encoder: Box<dyn CompressorWrite>,
+    compression_method: u16,
+}
+
+trait CompressorWrite: Write {
+    fn finish_compression(self: Box<Self>) -> Result<CrcCountingWriter>;
+    fn get_crc_writer_mut(&mut self) -> &mut CrcCountingWriter;
+}
+
+struct DeflateCompressor {
     encoder: DeflateEncoder<CrcCountingWriter>,
+}
+
+impl Write for DeflateCompressor {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.encoder.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.encoder.flush()
+    }
+}
+
+impl CompressorWrite for DeflateCompressor {
+    fn finish_compression(self: Box<Self>) -> Result<CrcCountingWriter> {
+        Ok(self.encoder.finish()?)
+    }
+
+    fn get_crc_writer_mut(&mut self) -> &mut CrcCountingWriter {
+        self.encoder.get_mut()
+    }
+}
+
+#[cfg(feature = "zstd-support")]
+struct ZstdCompressor {
+    encoder: zstd::Encoder<'static, CrcCountingWriter>,
+}
+
+#[cfg(feature = "zstd-support")]
+impl Write for ZstdCompressor {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.encoder.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.encoder.flush()
+    }
+}
+
+#[cfg(feature = "zstd-support")]
+impl CompressorWrite for ZstdCompressor {
+    fn finish_compression(self: Box<Self>) -> Result<CrcCountingWriter> {
+        Ok(self.encoder.finish()?)
+    }
+
+    fn get_crc_writer_mut(&mut self) -> &mut CrcCountingWriter {
+        self.encoder.get_mut()
+    }
 }
 
 /// Writer that counts bytes and computes CRC32 while writing to output
@@ -71,19 +153,47 @@ impl Write for CrcCountingWriter {
 }
 
 impl StreamingZipWriter {
-    /// Create a new ZIP writer with default compression level (6)
+    /// Create a new ZIP writer with default compression level (6) using DEFLATE
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::with_compression(path, 6)
     }
 
-    /// Create a new ZIP writer with custom compression level (0-9)
+    /// Create a new ZIP writer with custom compression level (0-9) using DEFLATE
     pub fn with_compression<P: AsRef<Path>>(path: P, compression_level: u32) -> Result<Self> {
+        Self::with_method(path, CompressionMethod::Deflate, compression_level)
+    }
+
+    /// Create a new ZIP writer with specified compression method and level
+    ///
+    /// # Arguments
+    /// * `path` - Path to the output ZIP file
+    /// * `method` - Compression method to use (Deflate, Zstd, or Stored)
+    /// * `compression_level` - Compression level (0-9 for DEFLATE, 1-21 for Zstd)
+    pub fn with_method<P: AsRef<Path>>(
+        path: P,
+        method: CompressionMethod,
+        compression_level: u32,
+    ) -> Result<Self> {
         let output = File::create(path)?;
         Ok(Self {
             output,
             entries: Vec::new(),
             current_entry: None,
-            compression_level: compression_level.min(9),
+            compression_level,
+            compression_method: method,
+        })
+    }
+
+    /// Create a new ZIP writer with Zstd compression (requires zstd-support feature)
+    #[cfg(feature = "zstd-support")]
+    pub fn with_zstd<P: AsRef<Path>>(path: P, compression_level: i32) -> Result<Self> {
+        let output = File::create(path)?;
+        Ok(Self {
+            output,
+            entries: Vec::new(),
+            current_entry: None,
+            compression_level: compression_level as u32,
+            compression_method: CompressionMethod::Zstd,
         })
     }
 
@@ -93,12 +203,13 @@ impl StreamingZipWriter {
         self.finish_current_entry()?;
 
         let local_header_offset = self.output.stream_position()?;
+        let compression_method = self.compression_method.to_zip_method();
 
         // Write local file header with data descriptor flag (bit 3)
         self.output.write_all(&[0x50, 0x4b, 0x03, 0x04])?; // signature
         self.output.write_all(&[20, 0])?; // version needed
         self.output.write_all(&[8, 0])?; // general purpose bit flag (bit 3 set)
-        self.output.write_all(&[8, 0])?; // compression method = deflate
+        self.output.write_all(&compression_method.to_le_bytes())?; // compression method
         self.output.write_all(&[0, 0, 0, 0])?; // mod time/date
         self.output.write_all(&0u32.to_le_bytes())?; // crc32 placeholder
         self.output.write_all(&0u32.to_le_bytes())?; // compressed size placeholder
@@ -107,15 +218,35 @@ impl StreamingZipWriter {
         self.output.write_all(&0u16.to_le_bytes())?; // extra len
         self.output.write_all(name.as_bytes())?;
 
-        // Create encoder for this entry
+        // Create encoder for this entry based on compression method
         let counting_writer = CrcCountingWriter::new(self.output.try_clone()?);
-        let encoder =
-            DeflateEncoder::new(counting_writer, Compression::new(self.compression_level));
+        let encoder: Box<dyn CompressorWrite> = match self.compression_method {
+            CompressionMethod::Deflate => Box::new(DeflateCompressor {
+                encoder: DeflateEncoder::new(
+                    counting_writer,
+                    Compression::new(self.compression_level),
+                ),
+            }),
+            #[cfg(feature = "zstd-support")]
+            CompressionMethod::Zstd => {
+                let mut encoder =
+                    zstd::Encoder::new(counting_writer, self.compression_level as i32)?;
+                encoder.include_checksum(false)?; // ZIP uses CRC32, not zstd checksum
+                Box::new(ZstdCompressor { encoder })
+            }
+            CompressionMethod::Stored => {
+                // For stored, we don't compress
+                return Err(SZipError::InvalidFormat(
+                    "Stored method not yet implemented".to_string(),
+                ));
+            }
+        };
 
         self.current_entry = Some(CurrentEntry {
             name: name.to_string(),
             local_header_offset,
             encoder,
+            compression_method,
         });
 
         Ok(())
@@ -125,8 +256,9 @@ impl StreamingZipWriter {
     pub fn write_data(&mut self, data: &[u8]) -> Result<()> {
         if let Some(ref mut entry) = self.current_entry {
             // Update CRC with uncompressed data
-            entry.encoder.get_mut().crc.update(data);
-            entry.encoder.get_mut().uncompressed_count += data.len() as u64;
+            let crc_writer = entry.encoder.get_crc_writer_mut();
+            crc_writer.crc.update(data);
+            crc_writer.uncompressed_count += data.len() as u64;
 
             // Write to encoder (compresses and writes to output)
             entry.encoder.write_all(data)?;
@@ -140,7 +272,7 @@ impl StreamingZipWriter {
     fn finish_current_entry(&mut self) -> Result<()> {
         if let Some(entry) = self.current_entry.take() {
             // Finish compression
-            let counting_writer = entry.encoder.finish()?;
+            let counting_writer = entry.encoder.finish_compression()?;
 
             let crc = counting_writer.crc.finalize();
             let compressed_size = counting_writer.compressed_count;
@@ -168,6 +300,7 @@ impl StreamingZipWriter {
                 crc32: crc,
                 compressed_size,
                 uncompressed_size,
+                compression_method: entry.compression_method,
             });
         }
         Ok(())
@@ -186,7 +319,8 @@ impl StreamingZipWriter {
             self.output.write_all(&[20, 0])?; // version made by
             self.output.write_all(&[20, 0])?; // version needed
             self.output.write_all(&[8, 0])?; // general purpose bit flag (bit 3 set)
-            self.output.write_all(&[8, 0])?; // compression method
+            self.output
+                .write_all(&entry.compression_method.to_le_bytes())?; // compression method
             self.output.write_all(&[0, 0, 0, 0])?; // mod time/date
             self.output.write_all(&entry.crc32.to_le_bytes())?;
 

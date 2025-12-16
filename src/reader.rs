@@ -104,6 +104,16 @@ impl StreamingZipReader {
         } else if entry.compression_method == 0 {
             // No compression (stored)
             compressed_data
+        } else if entry.compression_method == 93 {
+            // Zstd compression
+            #[cfg(feature = "zstd-support")]
+            {
+                zstd::decode_all(&compressed_data[..])?
+            }
+            #[cfg(not(feature = "zstd-support"))]
+            {
+                return Err(SZipError::UnsupportedCompression(entry.compression_method));
+            }
         } else {
             return Err(SZipError::UnsupportedCompression(entry.compression_method));
         };
@@ -173,6 +183,16 @@ impl StreamingZipReader {
         } else if entry.compression_method == 0 {
             // No compression (stored)
             Ok(Box::new(limited_reader))
+        } else if entry.compression_method == 93 {
+            // Zstd compression
+            #[cfg(feature = "zstd-support")]
+            {
+                Ok(Box::new(zstd::Decoder::new(limited_reader)?))
+            }
+            #[cfg(not(feature = "zstd-support"))]
+            {
+                Err(SZipError::UnsupportedCompression(entry.compression_method))
+            }
         } else {
             Err(SZipError::UnsupportedCompression(entry.compression_method))
         }
