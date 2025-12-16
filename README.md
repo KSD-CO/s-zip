@@ -178,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Method | Description | Default | Feature Flag | Best For |
 |--------|-------------|---------|--------------|----------|
-| DEFLATE (8) | Standard ZIP compression | ✓ | Always available | Text, source code, JSON, XML, CSV |
+| DEFLATE (8) | Standard ZIP compression | ✓ | Always available | Text, source code, JSON, XML, CSV, XLSX |
 | Stored (0) | No compression | - | Always available | Already compressed files (JPG, PNG, MP4, PDF) |
 | Zstd (93) | Modern compression algorithm | - | `zstd-support` | All text/data files, logs, databases |
 
@@ -186,8 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **Use DEFLATE (default)** when:
 - ✅ Maximum compatibility required (all ZIP tools support it)
-- ✅ Working with: text files, source code, JSON, XML, CSV, HTML
-- ✅ Small to medium files (<100MB)
+- ✅ Working with: text files, source code, JSON, XML, CSV, HTML, XLSX
 - ✅ Standard ZIP format compliance needed
 
 **Use Zstd** when:
