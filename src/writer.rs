@@ -6,6 +6,8 @@
 //! - Intermediate storage
 //!
 //! Expected RAM savings: 5-8 MB per file
+//!
+//! Now supports arbitrary writers (File, Vec<u8>, network streams, etc.)
 
 use crate::error::{Result, SZipError};
 use crc32fast::Hasher as Crc32;
@@ -49,8 +51,8 @@ struct ZipEntry {
 }
 
 /// Streaming ZIP writer that compresses data on-the-fly
-pub struct StreamingZipWriter {
-    output: File,
+pub struct StreamingZipWriter<W: Write + Seek> {
+    output: W,
     entries: Vec<ZipEntry>,
     current_entry: Option<CurrentEntry>,
     compression_level: u32,
@@ -61,16 +63,17 @@ struct CurrentEntry {
     name: String,
     local_header_offset: u64,
     encoder: Box<dyn CompressorWrite>,
+    counter: CrcCounter,
     compression_method: u16,
 }
 
 trait CompressorWrite: Write {
-    fn finish_compression(self: Box<Self>) -> Result<CrcCountingWriter>;
-    fn get_crc_writer_mut(&mut self) -> &mut CrcCountingWriter;
+    fn finish_compression(self: Box<Self>) -> Result<CompressedBuffer>;
+    fn get_buffer_mut(&mut self) -> &mut CompressedBuffer;
 }
 
 struct DeflateCompressor {
-    encoder: DeflateEncoder<CrcCountingWriter>,
+    encoder: DeflateEncoder<CompressedBuffer>,
 }
 
 impl Write for DeflateCompressor {
@@ -84,18 +87,18 @@ impl Write for DeflateCompressor {
 }
 
 impl CompressorWrite for DeflateCompressor {
-    fn finish_compression(self: Box<Self>) -> Result<CrcCountingWriter> {
+    fn finish_compression(self: Box<Self>) -> Result<CompressedBuffer> {
         Ok(self.encoder.finish()?)
     }
 
-    fn get_crc_writer_mut(&mut self) -> &mut CrcCountingWriter {
+    fn get_buffer_mut(&mut self) -> &mut CompressedBuffer {
         self.encoder.get_mut()
     }
 }
 
 #[cfg(feature = "zstd-support")]
 struct ZstdCompressor {
-    encoder: zstd::Encoder<'static, CrcCountingWriter>,
+    encoder: zstd::Encoder<'static, CompressedBuffer>,
 }
 
 #[cfg(feature = "zstd-support")]
@@ -111,48 +114,80 @@ impl Write for ZstdCompressor {
 
 #[cfg(feature = "zstd-support")]
 impl CompressorWrite for ZstdCompressor {
-    fn finish_compression(self: Box<Self>) -> Result<CrcCountingWriter> {
+    fn finish_compression(self: Box<Self>) -> Result<CompressedBuffer> {
         Ok(self.encoder.finish()?)
     }
 
-    fn get_crc_writer_mut(&mut self) -> &mut CrcCountingWriter {
+    fn get_buffer_mut(&mut self) -> &mut CompressedBuffer {
         self.encoder.get_mut()
     }
 }
 
-/// Writer that counts bytes and computes CRC32 while writing to output
-struct CrcCountingWriter {
-    output: File,
+/// Metadata tracker for CRC and byte counts
+struct CrcCounter {
     crc: Crc32,
     uncompressed_count: u64,
     compressed_count: u64,
 }
 
-impl CrcCountingWriter {
-    fn new(output: File) -> Self {
+impl CrcCounter {
+    fn new() -> Self {
         Self {
-            output,
             crc: Crc32::new(),
             uncompressed_count: 0,
             compressed_count: 0,
         }
     }
+
+    fn update_uncompressed(&mut self, data: &[u8]) {
+        self.crc.update(data);
+        self.uncompressed_count += data.len() as u64;
+    }
+
+    fn add_compressed(&mut self, count: u64) {
+        self.compressed_count += count;
+    }
+
+    fn finalize(&self) -> u32 {
+        self.crc.clone().finalize()
+    }
 }
 
-impl Write for CrcCountingWriter {
+/// Buffered writer for compressed data with size limit
+struct CompressedBuffer {
+    buffer: Vec<u8>,
+    flush_threshold: usize,
+}
+
+impl CompressedBuffer {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(64 * 1024), // 64KB initial capacity
+            flush_threshold: 1024 * 1024,          // 1MB threshold
+        }
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buffer)
+    }
+
+    fn should_flush(&self) -> bool {
+        self.buffer.len() >= self.flush_threshold
+    }
+}
+
+impl Write for CompressedBuffer {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // This is the compressed data being written
-        let n = self.output.write(buf)?;
-        self.compressed_count += n as u64;
-        Ok(n)
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.output.flush()
+        Ok(())
     }
 }
 
-impl StreamingZipWriter {
+impl StreamingZipWriter<File> {
     /// Create a new ZIP writer with default compression level (6) using DEFLATE
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::with_compression(path, 6)
@@ -196,6 +231,38 @@ impl StreamingZipWriter {
             compression_method: CompressionMethod::Zstd,
         })
     }
+}
+
+impl<W: Write + Seek> StreamingZipWriter<W> {
+    /// Create a new ZIP writer from an arbitrary writer with default compression level (6) using DEFLATE
+    pub fn from_writer(writer: W) -> Result<Self> {
+        Self::from_writer_with_compression(writer, 6)
+    }
+
+    /// Create a new ZIP writer from an arbitrary writer with custom compression level
+    pub fn from_writer_with_compression(writer: W, compression_level: u32) -> Result<Self> {
+        Self::from_writer_with_method(writer, CompressionMethod::Deflate, compression_level)
+    }
+
+    /// Create a new ZIP writer from an arbitrary writer with specified compression method and level
+    ///
+    /// # Arguments
+    /// * `writer` - Any writer implementing Write + Seek
+    /// * `method` - Compression method to use (Deflate, Zstd, or Stored)
+    /// * `compression_level` - Compression level (0-9 for DEFLATE, 1-21 for Zstd)
+    pub fn from_writer_with_method(
+        writer: W,
+        method: CompressionMethod,
+        compression_level: u32,
+    ) -> Result<Self> {
+        Ok(Self {
+            output: writer,
+            entries: Vec::new(),
+            current_entry: None,
+            compression_level,
+            compression_method: method,
+        })
+    }
 
     /// Start a new entry (file) in the ZIP
     pub fn start_entry(&mut self, name: &str) -> Result<()> {
@@ -219,18 +286,17 @@ impl StreamingZipWriter {
         self.output.write_all(name.as_bytes())?;
 
         // Create encoder for this entry based on compression method
-        let counting_writer = CrcCountingWriter::new(self.output.try_clone()?);
         let encoder: Box<dyn CompressorWrite> = match self.compression_method {
             CompressionMethod::Deflate => Box::new(DeflateCompressor {
                 encoder: DeflateEncoder::new(
-                    counting_writer,
+                    CompressedBuffer::new(),
                     Compression::new(self.compression_level),
                 ),
             }),
             #[cfg(feature = "zstd-support")]
             CompressionMethod::Zstd => {
                 let mut encoder =
-                    zstd::Encoder::new(counting_writer, self.compression_level as i32)?;
+                    zstd::Encoder::new(CompressedBuffer::new(), self.compression_level as i32)?;
                 encoder.include_checksum(false)?; // ZIP uses CRC32, not zstd checksum
                 Box::new(ZstdCompressor { encoder })
             }
@@ -246,6 +312,7 @@ impl StreamingZipWriter {
             name: name.to_string(),
             local_header_offset,
             encoder,
+            counter: CrcCounter::new(),
             compression_method,
         });
 
@@ -254,29 +321,48 @@ impl StreamingZipWriter {
 
     /// Write uncompressed data to current entry (will be compressed on-the-fly)
     pub fn write_data(&mut self, data: &[u8]) -> Result<()> {
-        if let Some(ref mut entry) = self.current_entry {
-            // Update CRC with uncompressed data
-            let crc_writer = entry.encoder.get_crc_writer_mut();
-            crc_writer.crc.update(data);
-            crc_writer.uncompressed_count += data.len() as u64;
+        let entry = self
+            .current_entry
+            .as_mut()
+            .ok_or_else(|| SZipError::InvalidFormat("No entry started".to_string()))?;
 
-            // Write to encoder (compresses and writes to output)
-            entry.encoder.write_all(data)?;
-            Ok(())
-        } else {
-            Err(SZipError::InvalidFormat("No entry started".to_string()))
+        // Update CRC and size with uncompressed data
+        entry.counter.update_uncompressed(data);
+
+        // Write to encoder (compresses data into buffer)
+        entry.encoder.write_all(data)?;
+
+        // Flush encoder to ensure all data is in buffer
+        entry.encoder.flush()?;
+
+        // Check if buffer should be flushed to output
+        let buffer = entry.encoder.get_buffer_mut();
+        if buffer.should_flush() {
+            // Flush buffer to output to keep memory usage low
+            let compressed_data = buffer.take();
+            self.output.write_all(&compressed_data)?;
+            entry.counter.add_compressed(compressed_data.len() as u64);
         }
+
+        Ok(())
     }
 
     /// Finish current entry and write data descriptor
     fn finish_current_entry(&mut self) -> Result<()> {
-        if let Some(entry) = self.current_entry.take() {
-            // Finish compression
-            let counting_writer = entry.encoder.finish_compression()?;
+        if let Some(mut entry) = self.current_entry.take() {
+            // Finish compression and get remaining buffered data
+            let mut buffer = entry.encoder.finish_compression()?;
 
-            let crc = counting_writer.crc.finalize();
-            let compressed_size = counting_writer.compressed_count;
-            let uncompressed_size = counting_writer.uncompressed_count;
+            // Flush any remaining data from buffer to output
+            let remaining_data = buffer.take();
+            if !remaining_data.is_empty() {
+                self.output.write_all(&remaining_data)?;
+                entry.counter.add_compressed(remaining_data.len() as u64);
+            }
+
+            let crc = entry.counter.finalize();
+            let compressed_size = entry.counter.compressed_count;
+            let uncompressed_size = entry.counter.uncompressed_count;
 
             // Write data descriptor
             // signature

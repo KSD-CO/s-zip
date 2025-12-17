@@ -26,15 +26,14 @@ fn test_compression(
     name: &str,
     data: &[u8],
     method_name: &str,
-    create_writer: impl FnOnce(&std::path::Path) -> s_zip::Result<StreamingZipWriter>,
+    // Closure should perform the full write into the ZIP at given path using the provided data
+    create_writer: impl FnOnce(&std::path::Path, &[u8]) -> s_zip::Result<()>,
 ) {
     let temp = NamedTempFile::new().unwrap();
     let path = temp.path();
 
-    let mut writer = create_writer(path).unwrap();
-    writer.start_entry("test.bin").unwrap();
-    writer.write_data(data).unwrap();
-    writer.finish().unwrap();
+    // Let the closure create the writer, write the provided data and finish the archive
+    create_writer(path, data).unwrap();
 
     let compressed_size = fs::metadata(path).unwrap().len();
     let original_size = data.len() as u64;
@@ -81,35 +80,89 @@ fn main() {
         "Compressible 1MB",
         &compressible_1mb,
         "DEFLATE lvl 1",
-        |p| StreamingZipWriter::with_compression(p, 1),
+        |p, data| {
+            let mut writer = StreamingZipWriter::with_compression(p, 1)?;
+            writer.start_entry("test.bin")?;
+            writer.write_data(data)?;
+            writer.finish()?;
+            Ok(())
+        },
     );
     test_compression(
         "Compressible 1MB",
         &compressible_1mb,
         "DEFLATE lvl 6",
-        |p| StreamingZipWriter::with_compression(p, 6),
+        |p, data| {
+            let mut writer = StreamingZipWriter::with_compression(p, 6)?;
+            writer.start_entry("test.bin")?;
+            writer.write_data(data)?;
+            writer.finish()?;
+            Ok(())
+        },
     );
     test_compression(
         "Compressible 1MB",
         &compressible_1mb,
         "DEFLATE lvl 9",
-        |p| StreamingZipWriter::with_compression(p, 9),
+        |p, data| {
+            let mut writer = StreamingZipWriter::with_compression(p, 9)?;
+            writer.start_entry("test.bin")?;
+            writer.write_data(data)?;
+            writer.finish()?;
+            Ok(())
+        },
     );
 
     #[cfg(feature = "zstd-support")]
     {
-        test_compression("Compressible 1MB", &compressible_1mb, "Zstd lvl 1", |p| {
-            StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 1)
-        });
-        test_compression("Compressible 1MB", &compressible_1mb, "Zstd lvl 3", |p| {
-            StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 3)
-        });
-        test_compression("Compressible 1MB", &compressible_1mb, "Zstd lvl 10", |p| {
-            StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 10)
-        });
-        test_compression("Compressible 1MB", &compressible_1mb, "Zstd lvl 21", |p| {
-            StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 21)
-        });
+        test_compression(
+            "Compressible 1MB",
+            &compressible_1mb,
+            "Zstd lvl 1",
+            |p, data| {
+                let mut writer = StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 1)?;
+                writer.start_entry("test.bin")?;
+                writer.write_data(data)?;
+                writer.finish()?;
+                Ok(())
+            },
+        );
+        test_compression(
+            "Compressible 1MB",
+            &compressible_1mb,
+            "Zstd lvl 3",
+            |p, data| {
+                let mut writer = StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 3)?;
+                writer.start_entry("test.bin")?;
+                writer.write_data(data)?;
+                writer.finish()?;
+                Ok(())
+            },
+        );
+        test_compression(
+            "Compressible 1MB",
+            &compressible_1mb,
+            "Zstd lvl 10",
+            |p, data| {
+                let mut writer = StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 10)?;
+                writer.start_entry("test.bin")?;
+                writer.write_data(data)?;
+                writer.finish()?;
+                Ok(())
+            },
+        );
+        test_compression(
+            "Compressible 1MB",
+            &compressible_1mb,
+            "Zstd lvl 21",
+            |p, data| {
+                let mut writer = StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 21)?;
+                writer.start_entry("test.bin")?;
+                writer.write_data(data)?;
+                writer.finish()?;
+                Ok(())
+            },
+        );
     }
 
     println!();
@@ -117,20 +170,36 @@ fn main() {
     // Test 1MB random data
     let random_1mb = generate_random_data(1024 * 1024);
 
-    test_compression("Random 1MB", &random_1mb, "DEFLATE lvl 6", |p| {
-        StreamingZipWriter::with_compression(p, 6)
+    test_compression("Random 1MB", &random_1mb, "DEFLATE lvl 6", |p, data| {
+        let mut writer = StreamingZipWriter::with_compression(p, 6)?;
+        writer.start_entry("test.bin")?;
+        writer.write_data(data)?;
+        writer.finish()?;
+        Ok(())
     });
-    test_compression("Random 1MB", &random_1mb, "DEFLATE lvl 9", |p| {
-        StreamingZipWriter::with_compression(p, 9)
+    test_compression("Random 1MB", &random_1mb, "DEFLATE lvl 9", |p, data| {
+        let mut writer = StreamingZipWriter::with_compression(p, 9)?;
+        writer.start_entry("test.bin")?;
+        writer.write_data(data)?;
+        writer.finish()?;
+        Ok(())
     });
 
     #[cfg(feature = "zstd-support")]
     {
-        test_compression("Random 1MB", &random_1mb, "Zstd lvl 3", |p| {
-            StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 3)
+        test_compression("Random 1MB", &random_1mb, "Zstd lvl 3", |p, data| {
+            let mut writer = StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 3)?;
+            writer.start_entry("test.bin")?;
+            writer.write_data(data)?;
+            writer.finish()?;
+            Ok(())
         });
-        test_compression("Random 1MB", &random_1mb, "Zstd lvl 10", |p| {
-            StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 10)
+        test_compression("Random 1MB", &random_1mb, "Zstd lvl 10", |p, data| {
+            let mut writer = StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 10)?;
+            writer.start_entry("test.bin")?;
+            writer.write_data(data)?;
+            writer.finish()?;
+            Ok(())
         });
     }
 
@@ -143,25 +212,52 @@ fn main() {
         "Compressible 10MB",
         &compressible_10mb,
         "DEFLATE lvl 6",
-        |p| StreamingZipWriter::with_compression(p, 6),
+        |p, data| {
+            let mut writer = StreamingZipWriter::with_compression(p, 6)?;
+            writer.start_entry("test.bin")?;
+            writer.write_data(data)?;
+            writer.finish()?;
+            Ok(())
+        },
     );
     test_compression(
         "Compressible 10MB",
         &compressible_10mb,
         "DEFLATE lvl 9",
-        |p| StreamingZipWriter::with_compression(p, 9),
+        |p, data| {
+            let mut writer = StreamingZipWriter::with_compression(p, 9)?;
+            writer.start_entry("test.bin")?;
+            writer.write_data(data)?;
+            writer.finish()?;
+            Ok(())
+        },
     );
 
     #[cfg(feature = "zstd-support")]
     {
-        test_compression("Compressible 10MB", &compressible_10mb, "Zstd lvl 3", |p| {
-            StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 3)
-        });
+        test_compression(
+            "Compressible 10MB",
+            &compressible_10mb,
+            "Zstd lvl 3",
+            |p, data| {
+                let mut writer = StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 3)?;
+                writer.start_entry("test.bin")?;
+                writer.write_data(data)?;
+                writer.finish()?;
+                Ok(())
+            },
+        );
         test_compression(
             "Compressible 10MB",
             &compressible_10mb,
             "Zstd lvl 10",
-            |p| StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 10),
+            |p, data| {
+                let mut writer = StreamingZipWriter::with_method(p, CompressionMethod::Zstd, 10)?;
+                writer.start_entry("test.bin")?;
+                writer.write_data(data)?;
+                writer.finish()?;
+                Ok(())
+            },
         );
     }
 

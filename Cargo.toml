@@ -1,9 +1,9 @@
 [package]
 name = "s-zip"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Ton That Vu <ttvuhm@gmail.com>"]
-description = "High-performance streaming ZIP library - Read/write ZIP files with minimal memory footprint"
+description = "High-performance streaming ZIP library - Read/write ZIP files with minimal memory footprint. Supports arbitrary writers."
 license = "MIT"
 repository = "https://github.com/KSD-CO/s-zip"
 keywords = ["zip", "streaming", "compression", "deflate", "archive"]

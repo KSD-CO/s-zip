@@ -31,10 +31,11 @@ Most ZIP libraries assume small files or in-memory buffers.
 ## Key Features
 
 - **Streaming ZIP writer** (no full buffering)
+- **Arbitrary writer support** (File, Vec<u8>, network streams, etc.)
 - **Streaming ZIP reader** with minimal memory footprint
 - **ZIP64 support** for files >4GB
 - **Multiple compression methods**: DEFLATE, Zstd (optional)
-- **Predictable memory usage**: ~2-5 MB constant
+- **Predictable memory usage**: ~2-5 MB constant with 1MB buffer threshold
 - **High performance**: Zstd 3x faster than DEFLATE with 11-27x better compression
 - **Rust safety guarantees**
 - **Backend-friendly API**
@@ -76,10 +77,10 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-s-zip = "0.2"
+s-zip = "0.3"
 
 # Optional: Enable Zstd compression support
-# s-zip = { version = "0.2", features = ["zstd-support"] }
+# s-zip = { version = "0.3", features = ["zstd-support"] }
 ```
 
 ### Optional Features
@@ -173,6 +174,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 **Note**: Zstd compression provides better compression ratios than DEFLATE but may have slower decompression on some systems. The reader will automatically detect and decompress Zstd-compressed entries when the `zstd-support` feature is enabled.
+
+### Using Arbitrary Writers (Advanced)
+
+**NEW in v0.3.0**: `s-zip` now supports writing to any type that implements `Write + Seek`, not just files. This enables:
+
+- **In-memory ZIP creation** (Vec<u8>, Cursor)
+- **Network streaming** (TCP streams with buffering)
+- **Custom storage backends** (S3, databases, etc.)
+
+```rust
+use s_zip::StreamingZipWriter;
+use std::io::Cursor;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Write ZIP to in-memory buffer
+    let buffer = Vec::new();
+    let cursor = Cursor::new(buffer);
+
+    let mut writer = StreamingZipWriter::from_writer(cursor)?;
+
+    writer.start_entry("data.txt")?;
+    writer.write_data(b"In-memory ZIP content")?;
+
+    writer.finish()?;
+
+    Ok(())
+}
+```
+
+**⚠️ IMPORTANT - Memory Usage by Writer Type:**
+
+| Writer Type | Memory Usage | Best For |
+|-------------|--------------|----------|
+| **File** (`StreamingZipWriter::new(path)`) | ✅ ~2-5 MB constant | Large files, production use |
+| **Network streams** (TCP, pipes) | ✅ ~2-5 MB constant | Streaming over network |
+| **Vec<u8>/Cursor** (`from_writer()`) | ⚠️ **ENTIRE ZIP IN RAM** | **Small archives only (<100MB)** |
+
+**⚠️ Critical Warning for Vec<u8>/Cursor:**
+When using `Vec<u8>` or `Cursor<Vec<u8>>` as the writer, the **entire compressed ZIP file will be stored in memory**. While the compressor still uses only ~2-5MB for its internal buffer, the final output accumulates in the Vec. **Only use this for small archives** or when you have sufficient RAM.
+
+**Recommended approach for large files:**
+- Use `StreamingZipWriter::new(path)` to write to disk (constant ~2-5MB memory)
+- Use network streams for real-time transmission
+- Reserve `Vec<u8>/Cursor` for small temporary ZIPs (<100MB)
+
+The implementation uses a 1MB buffer threshold to periodically flush compressed data to the writer, keeping **compression memory** low (~2-5MB) for all writer types. However, in-memory writers like `Vec<u8>` will still accumulate the full output.
+
+See [examples/arbitrary_writer.rs](examples/arbitrary_writer.rs) for more examples.
 
 ## Supported Compression Methods
 
