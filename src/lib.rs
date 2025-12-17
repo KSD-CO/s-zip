@@ -47,6 +47,28 @@
 //! writer.finish()?;
 //! # Ok::<(), s_zip::SZipError>(())
 //! ```
+//!
+//! ### Using arbitrary writers (in-memory, network, etc.)
+//!
+//! ```no_run
+//! use s_zip::StreamingZipWriter;
+//! use std::io::Cursor;
+//!
+//! // Write ZIP to in-memory buffer
+//! let buffer = Vec::new();
+//! let cursor = Cursor::new(buffer);
+//! let mut writer = StreamingZipWriter::from_writer(cursor)?;
+//!
+//! writer.start_entry("data.txt")?;
+//! writer.write_data(b"In-memory ZIP content")?;
+//!
+//! // finish() returns the writer, allowing you to extract the data
+//! let cursor = writer.finish()?;
+//! let zip_bytes = cursor.into_inner();
+//!
+//! println!("Created ZIP with {} bytes", zip_bytes.len());
+//! # Ok::<(), s_zip::SZipError>(())
+//! ```
 
 pub mod error;
 pub mod reader;

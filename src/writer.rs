@@ -392,8 +392,8 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         Ok(())
     }
 
-    /// Finish ZIP file (write central directory and close)
-    pub fn finish(mut self) -> Result<()> {
+    /// Finish ZIP file (write central directory and return the writer)
+    pub fn finish(mut self) -> Result<W> {
         // Finish last entry
         self.finish_current_entry()?;
 
@@ -550,6 +550,6 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         self.output.write_all(&0u16.to_le_bytes())?; // comment len
 
         self.output.flush()?;
-        Ok(())
+        Ok(self.output)
     }
 }

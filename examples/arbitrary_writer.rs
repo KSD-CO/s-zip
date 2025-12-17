@@ -3,6 +3,11 @@
 //! This shows how to write ZIP files to any writer (not just files),
 //! such as in-memory buffers, network streams, etc.
 //!
+//! The `.finish()` method returns the writer, allowing you to:
+//! - Extract the Vec<u8> from a Cursor to get the ZIP bytes
+//! - Continue using the writer for other purposes
+//! - Save in-memory ZIPs to disk or send over network
+//!
 //! ⚠️ IMPORTANT: When using Vec<u8> or Cursor<Vec<u8>>, the ENTIRE compressed
 //! ZIP file will be stored in RAM. Only use this for small archives (<100MB).
 //! For large files, use StreamingZipWriter::new(path) to write to disk instead.
@@ -25,8 +30,13 @@ fn main() -> Result<()> {
     zip.start_entry("data.txt")?;
     zip.write_data(b"Some data in the second file.")?;
 
-    zip.finish()?;
-    println!("✓ Successfully created in-memory ZIP");
+    // Get the cursor back after finishing
+    let cursor = zip.finish()?;
+    let zip_bytes = cursor.into_inner();
+    println!(
+        "✓ Successfully created in-memory ZIP ({} bytes)",
+        zip_bytes.len()
+    );
 
     // Example 2: Write ZIP with custom compression level
     println!("\nExample 2: Writing with custom compression level...");
@@ -39,8 +49,12 @@ fn main() -> Result<()> {
     let large_data = "Hello World! ".repeat(1000);
     zip2.write_data(large_data.as_bytes())?;
 
-    zip2.finish()?;
-    println!("✓ Successfully created highly compressed ZIP");
+    let cursor2 = zip2.finish()?;
+    let zip_bytes2 = cursor2.into_inner();
+    println!(
+        "✓ Successfully created highly compressed ZIP ({} bytes)",
+        zip_bytes2.len()
+    );
 
     // Example 3: Demonstrate that it works with seekable writers
     println!("\nExample 3: Using Cursor for random access...");
@@ -53,9 +67,34 @@ fn main() -> Result<()> {
     let mut zip3 = StreamingZipWriter::from_writer(cursor3)?;
     zip3.start_entry("after_prefix.txt")?;
     zip3.write_data(b"This ZIP starts after the prefix")?;
-    zip3.finish()?;
 
-    println!("✓ Successfully created ZIP with custom position");
+    let cursor3 = zip3.finish()?;
+    let final_buffer = cursor3.into_inner();
+    println!(
+        "✓ Successfully created ZIP with custom position ({} bytes total, {} prefix)",
+        final_buffer.len(),
+        "PREFIX_".len()
+    );
+
+    // Example 4: Get the ZIP bytes and save to file
+    println!("\nExample 4: Creating in-memory ZIP and saving to file...");
+    let buffer4 = Vec::new();
+    let cursor4 = Cursor::new(buffer4);
+
+    let mut zip4 = StreamingZipWriter::from_writer(cursor4)?;
+    zip4.start_entry("output.txt")?;
+    zip4.write_data(b"This was created in memory, then saved to disk!")?;
+
+    // Get the writer back and extract the bytes
+    let cursor4 = zip4.finish()?;
+    let zip_data = cursor4.into_inner();
+
+    // Now we can do whatever we want with the bytes
+    std::fs::write("/tmp/example_output.zip", &zip_data)?;
+    println!(
+        "✓ Successfully saved in-memory ZIP to /tmp/example_output.zip ({} bytes)",
+        zip_data.len()
+    );
 
     println!("\n✓ All examples completed successfully!");
     println!("\n⚠️  CRITICAL - Memory Usage by Writer Type:");

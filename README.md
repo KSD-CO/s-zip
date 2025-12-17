@@ -197,7 +197,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.start_entry("data.txt")?;
     writer.write_data(b"In-memory ZIP content")?;
 
-    writer.finish()?;
+    // finish() returns the writer, allowing you to extract the data
+    let cursor = writer.finish()?;
+    let zip_bytes = cursor.into_inner();
+
+    // Now you can save to file, send over network, etc.
+    std::fs::write("output.zip", &zip_bytes)?;
+    println!("Created ZIP with {} bytes", zip_bytes.len());
 
     Ok(())
 }
