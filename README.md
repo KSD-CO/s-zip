@@ -31,12 +31,14 @@ Most ZIP libraries assume small files or in-memory buffers.
 ## Key Features
 
 - **Streaming ZIP writer** (no full buffering)
+- **Async/await support** ⚡ NEW in v0.4.0! Compatible with Tokio runtime
 - **Arbitrary writer support** (File, Vec<u8>, network streams, etc.)
 - **Streaming ZIP reader** with minimal memory footprint
 - **ZIP64 support** for files >4GB
 - **Multiple compression methods**: DEFLATE, Zstd (optional)
 - **Predictable memory usage**: ~2-5 MB constant with 1MB buffer threshold
 - **High performance**: Zstd 3x faster than DEFLATE with 11-27x better compression
+- **Concurrent operations**: Create multiple ZIPs simultaneously with async
 - **Rust safety guarantees**
 - **Backend-friendly API**
 
@@ -48,10 +50,13 @@ Most ZIP libraries assume small files or in-memory buffers.
 
 ## Typical Use Cases
 
+- **Web applications** (Axum, Actix, Rocket) - Generate ZIPs on-demand
+- **Cloud services** - Stream ZIPs to S3, GCS without local storage
 - Generating large ZIP exports on the server
 - Packaging reports or datasets
 - Data pipelines and batch jobs
 - Infrastructure tools that require ZIP as an intermediate format
+- **Real-time streaming** - WebSocket, SSE, HTTP uploads
 
 ## Performance Highlights
 
@@ -77,15 +82,24 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-s-zip = "0.3"
+s-zip = "0.4"
 
-# Optional: Enable Zstd compression support
-# s-zip = { version = "0.3", features = ["zstd-support"] }
+# With async support (Tokio runtime)
+s-zip = { version = "0.4", features = ["async"] }
+
+# With async + Zstd compression
+s-zip = { version = "0.4", features = ["async", "async-zstd"] }
 ```
 
 ### Optional Features
 
-- **`zstd-support`**: Enables Zstd compression (method 93) for reading and writing ZIP files with better compression ratios. This adds the `zstd` crate as a dependency.
+| Feature | Description | Dependencies |
+|---------|-------------|--------------|
+| **`async`** | Enables async/await support with Tokio runtime | tokio, async-compression |
+| **`async-zstd`** | Async + Zstd compression support | async, zstd-support |
+| **`zstd-support`** | Zstd compression for sync API | zstd |
+
+**Note**: `async-zstd` includes both `async` and `zstd-support` features.
 
 ### Reading a ZIP file
 
@@ -174,6 +188,149 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 **Note**: Zstd compression provides better compression ratios than DEFLATE but may have slower decompression on some systems. The reader will automatically detect and decompress Zstd-compressed entries when the `zstd-support` feature is enabled.
+
+## Async/Await Support (NEW in v0.4.0!)
+
+`s-zip` now supports async/await with Tokio runtime, enabling non-blocking I/O for web servers and cloud applications.
+
+### When to Use Async?
+
+**✅ Use Async for:**
+- Web frameworks (Axum, Actix, Rocket)
+- Cloud storage uploads (S3, GCS, Azure)
+- Network streams (HTTP, WebSocket)
+- Concurrent operations (multiple ZIPs simultaneously)
+- Real-time applications
+
+**✅ Use Sync for:**
+- CLI tools and scripts
+- Batch processing (single-threaded)
+- Maximum throughput (CPU-bound tasks)
+
+### Async Writer Example
+
+```rust
+use s_zip::AsyncStreamingZipWriter;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = AsyncStreamingZipWriter::new("output.zip").await?;
+
+    writer.start_entry("hello.txt").await?;
+    writer.write_data(b"Hello, async world!").await?;
+
+    writer.start_entry("data.txt").await?;
+    writer.write_data(b"Streaming with async/await").await?;
+
+    writer.finish().await?;
+    Ok(())
+}
+```
+
+### Async with In-Memory (Cloud Upload)
+
+Perfect for HTTP responses or cloud storage:
+
+```rust
+use s_zip::AsyncStreamingZipWriter;
+use std::io::Cursor;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create ZIP in memory
+    let buffer = Vec::new();
+    let cursor = Cursor::new(buffer);
+
+    let mut writer = AsyncStreamingZipWriter::from_writer(cursor);
+
+    writer.start_entry("data.json").await?;
+    writer.write_data(br#"{"status": "ok"}"#).await?;
+
+    // Get ZIP bytes for upload
+    let cursor = writer.finish().await?;
+    let zip_bytes = cursor.into_inner();
+
+    // Upload to S3, send as HTTP response, etc.
+    println!("Created {} bytes", zip_bytes.len());
+
+    Ok(())
+}
+```
+
+### Streaming from Async Sources
+
+Stream files directly without blocking:
+
+```rust
+use s_zip::AsyncStreamingZipWriter;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = AsyncStreamingZipWriter::new("archive.zip").await?;
+
+    // Stream large file without loading into memory
+    writer.start_entry("large_file.bin").await?;
+
+    let mut file = File::open("source.bin").await?;
+    let mut buffer = vec![0u8; 8192];
+
+    loop {
+        let n = file.read(&mut buffer).await?;
+        if n == 0 { break; }
+        writer.write_data(&buffer[..n]).await?;
+    }
+
+    writer.finish().await?;
+    Ok(())
+}
+```
+
+### Concurrent ZIP Creation
+
+Create multiple ZIPs simultaneously (5x faster than sequential):
+
+```rust
+use s_zip::AsyncStreamingZipWriter;
+use tokio::task::JoinSet;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut tasks = JoinSet::new();
+
+    // Create 10 ZIPs concurrently
+    for i in 0..10 {
+        tasks.spawn(async move {
+            let path = format!("output_{}.zip", i);
+            let mut writer = AsyncStreamingZipWriter::new(&path).await?;
+            writer.start_entry("data.txt").await?;
+            writer.write_data(b"Concurrent creation!").await?;
+            writer.finish().await?;
+            Ok::<_, s_zip::SZipError>(())
+        });
+    }
+
+    // Wait for all to complete
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap()?;
+    }
+
+    println!("Created 10 ZIPs concurrently!");
+    Ok(())
+}
+```
+
+### Performance: Async vs Sync
+
+| Scenario | Sync | Async | Advantage |
+|----------|------|-------|-----------|
+| **Local disk (5MB)** | 6.7ms | 7.1ms | ≈ Same (~6% overhead) |
+| **In-memory (100KB)** | 146µs | 136µs | **Async 7% faster** |
+| **Network upload (5×50KB)** | 1053ms | 211ms | **Async 5x faster** 🚀 |
+| **10 concurrent operations** | 70ms | 10-15ms | **Async 4-7x faster** 🚀 |
+
+**See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks.**
 
 ### Using Arbitrary Writers (Advanced)
 
@@ -304,6 +461,98 @@ Results are saved to `target/criterion/` with HTML reports showing detailed stat
 - Multiple compression levels comparison
 - Random vs compressible data patterns
 
+## Migration Guide
+
+### Upgrading from v0.3.x to v0.4.0
+
+**Zero Breaking Changes!** The v0.4.0 release is fully backward compatible.
+
+**What's New:**
+- ✅ Async/await support (opt-in via `async` feature)
+- ✅ Concurrent ZIP creation
+- ✅ Better performance for network/cloud operations
+- ✅ All existing sync code works unchanged
+
+**Migration Options:**
+
+**Option 1: Keep Using Sync (No Changes)**
+```toml
+[dependencies]
+s-zip = "0.4"  # No feature flags needed
+```
+
+Your existing code continues to work exactly as before!
+
+**Option 2: Add Async Support**
+```toml
+[dependencies]
+s-zip = { version = "0.4", features = ["async"] }
+```
+
+Now you can use both:
+- `StreamingZipWriter` (sync, existing code)
+- `AsyncStreamingZipWriter` (new async API)
+
+**Option 3: Async + Zstd**
+```toml
+[dependencies]
+s-zip = { version = "0.4", features = ["async-zstd"] }
+```
+
+Enables both async and Zstd compression.
+
+**API Comparison:**
+
+```rust
+// Sync (v0.3.x and v0.4.0)
+let mut writer = StreamingZipWriter::new("output.zip")?;
+writer.start_entry("file.txt")?;
+writer.write_data(b"data")?;
+writer.finish()?;
+
+// Async (NEW in v0.4.0)
+let mut writer = AsyncStreamingZipWriter::new("output.zip").await?;
+writer.start_entry("file.txt").await?;
+writer.write_data(b"data").await?;
+writer.finish().await?;
+```
+
+The only differences: `AsyncStreamingZipWriter` and `.await` keywords!
+
+## Examples
+
+Check out the [examples/](examples/) directory for complete working examples:
+
+**Sync Examples:**
+- [basic.rs](examples/basic.rs) - Simple ZIP creation
+- [arbitrary_writer.rs](examples/arbitrary_writer.rs) - In-memory ZIPs
+- [zstd_compression.rs](examples/zstd_compression.rs) - Zstd compression
+
+**Async Examples (NEW!):**
+- [async_basic.rs](examples/async_basic.rs) - Basic async usage
+- [async_streaming.rs](examples/async_streaming.rs) - Stream files to ZIP
+- [async_in_memory.rs](examples/async_in_memory.rs) - Cloud upload simulation
+- [concurrent_demo.rs](examples/concurrent_demo.rs) - Concurrent creation
+- [network_simulation.rs](examples/network_simulation.rs) - Network I/O demo
+
+Run examples:
+```bash
+# Sync examples
+cargo run --example basic
+cargo run --example zstd_compression --features zstd-support
+
+# Async examples
+cargo run --example async_basic --features async
+cargo run --example concurrent_demo --features async
+cargo run --example network_simulation --features async
+```
+
+## Documentation
+
+- **API Documentation**: https://docs.rs/s-zip
+- **Performance Benchmarks**: [PERFORMANCE.md](PERFORMANCE.md)
+- **Benchmark Results**: [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md)
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.
@@ -311,7 +560,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
-
 
 ## Author
 

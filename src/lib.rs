@@ -74,6 +74,12 @@ pub mod error;
 pub mod reader;
 pub mod writer;
 
+#[cfg(feature = "async")]
+pub mod async_writer;
+
 pub use error::{Result, SZipError};
 pub use reader::{StreamingZipReader, ZipEntry};
 pub use writer::{CompressionMethod, StreamingZipWriter};
+
+#[cfg(feature = "async")]
+pub use async_writer::AsyncStreamingZipWriter;

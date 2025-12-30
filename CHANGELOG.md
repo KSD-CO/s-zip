@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2024-12-30
+
+### Added ⚡
+
+- **Async/await support** with Tokio runtime
+  - `AsyncStreamingZipWriter` for non-blocking ZIP creation
+  - Compatible with Axum, Actix, Rocket and other async frameworks
+  - Concurrent ZIP creation (4-7x faster for parallel operations)
+  - Network stream support (HTTP, WebSocket, cloud storage)
+
+- **New feature flags**
+  - `async`: Enables async/await support
+  - `async-zstd`: Enables both async and Zstd compression
+
+- **Performance improvements**
+  - In-memory operations 7% faster with async
+  - Network/cloud operations 5x faster with concurrent async
+  - Minimal overhead (~6%) for local disk I/O
+
+- **New examples**
+  - `async_basic.rs`: Basic async ZIP creation
+  - `async_streaming.rs`: Stream files to ZIP
+  - `async_in_memory.rs`: Cloud upload simulation
+  - `concurrent_demo.rs`: Concurrent ZIP creation
+  - `network_simulation.rs`: Network I/O performance demo
+  - `perf_test.rs`: Quick performance comparison
+
+- **Comprehensive documentation**
+  - [PERFORMANCE.md](PERFORMANCE.md): Async vs Sync benchmarks
+  - Migration guide in README
+  - API comparison examples
+
+- **Benchmarks**
+  - `async_bench.rs`: Criterion benchmarks for async performance
+  - Memory usage profiling with `/usr/bin/time`
+  - Throughput comparisons across different scenarios
+
+### Changed
+
+- Updated package description to mention async support
+- Enhanced README with async examples and migration guide
+- Performance section now includes async metrics
+
+### Backward Compatibility ✅
+
+- **Zero breaking changes!**
+- All existing sync code works unchanged
+- Async support is opt-in via feature flags
+- Full API compatibility with v0.3.x
+
+### Performance Metrics
+
+| Operation | Sync | Async | Advantage |
+|-----------|------|-------|-----------|
+| Local disk (5MB) | 6.7ms | 7.1ms | ~6% overhead (acceptable) |
+| In-memory (100KB) | 146µs | 136µs | Async 7% faster |
+| Network (5×50KB) | 1053ms | 211ms | **Async 5x faster** |
+| 10 concurrent ops | 70ms | 10-15ms | **Async 4-7x faster** |
+
+### Dependencies
+
+**New optional dependencies:**
+- `tokio ^1.35` (async runtime)
+- `async-compression ^0.4` (async compression)
+- `futures-util ^0.3` (async utilities)
+- `pin-project-lite ^0.2` (pin projection)
+
 ## [0.3.0] - 2025-12-17
 
 ### Added

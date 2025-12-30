@@ -30,7 +30,7 @@ pub enum CompressionMethod {
 }
 
 impl CompressionMethod {
-    fn to_zip_method(self) -> u16 {
+    pub(crate) fn to_zip_method(self) -> u16 {
         match self {
             CompressionMethod::Stored => 0,
             CompressionMethod::Deflate => 8,
