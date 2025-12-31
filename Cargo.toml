@@ -1,6 +1,6 @@
 [package]
 name = "s-zip"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Ton That Vu <ttvuhm@gmail.com>"]
 description = "High-performance streaming ZIP library with async/await support - Read/write ZIP files with minimal memory footprint. Supports arbitrary writers and Tokio runtime."
@@ -21,6 +21,12 @@ async-compression = { version = "0.4", optional = true, features = ["tokio", "de
 futures-util = { version = "0.3", optional = true }
 pin-project-lite = { version = "0.2", optional = true }
 
+# Cloud storage dependencies (optional)
+aws-config = { version = "1.5", optional = true, features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.80", optional = true, features = ["behavior-version-latest"] }
+google-cloud-storage = { version = "0.22", optional = true }
+google-cloud-auth = { version = "0.17", optional = true }
+
 [dev-dependencies]
 tempfile = "3.8"
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -32,6 +38,9 @@ default = []
 zstd-support = ["zstd"]
 async = ["tokio", "async-compression", "futures-util", "pin-project-lite"]
 async-zstd = ["async", "zstd-support", "async-compression/zstd"]
+cloud-s3 = ["async", "aws-config", "aws-sdk-s3"]
+cloud-gcs = ["async", "google-cloud-storage", "google-cloud-auth"]
+cloud-all = ["cloud-s3", "cloud-gcs"]
 
 [[bench]]
 name = "compression_bench"

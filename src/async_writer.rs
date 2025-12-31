@@ -597,7 +597,11 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
 
         self.output.write_all(&0u16.to_le_bytes()).await?; // comment len
 
+        // CRITICAL: Must call shutdown() to ensure cloud uploads complete
+        // For cloud writers like S3ZipWriter, shutdown() completes the multipart upload
         self.output.flush().await?;
+        self.output.shutdown().await?;
+
         Ok(self.output)
     }
 }

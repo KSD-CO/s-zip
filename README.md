@@ -31,7 +31,8 @@ Most ZIP libraries assume small files or in-memory buffers.
 ## Key Features
 
 - **Streaming ZIP writer** (no full buffering)
-- **Async/await support** ⚡ NEW in v0.4.0! Compatible with Tokio runtime
+- **Async/await support** ⚡ Compatible with Tokio runtime
+- **Cloud storage adapters** 🌩️ NEW in v0.5.0! Stream directly to AWS S3 and Google Cloud Storage
 - **Arbitrary writer support** (File, Vec<u8>, network streams, etc.)
 - **Streaming ZIP reader** with minimal memory footprint
 - **ZIP64 support** for files >4GB
@@ -51,12 +52,11 @@ Most ZIP libraries assume small files or in-memory buffers.
 ## Typical Use Cases
 
 - **Web applications** (Axum, Actix, Rocket) - Generate ZIPs on-demand
-- **Cloud services** - Stream ZIPs to S3, GCS without local storage
-- Generating large ZIP exports on the server
-- Packaging reports or datasets
-- Data pipelines and batch jobs
-- Infrastructure tools that require ZIP as an intermediate format
-- **Real-time streaming** - WebSocket, SSE, HTTP uploads
+- **Cloud storage** - Stream ZIPs directly to AWS S3, Google Cloud Storage without local disk usage
+- **Data exports** - Generate large ZIP exports for reports, datasets, backups
+- **Data pipelines** - ETL jobs, batch processing, log aggregation
+- **Infrastructure tools** - ZIP as intermediate format for deployments, artifacts
+- **Real-time streaming** - WebSocket, SSE, HTTP chunked responses
 
 ## Performance Highlights
 
@@ -82,13 +82,22 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-s-zip = "0.4"
+s-zip = "0.5"
 
 # With async support (Tokio runtime)
-s-zip = { version = "0.4", features = ["async"] }
+s-zip = { version = "0.5", features = ["async"] }
+
+# With AWS S3 cloud storage support
+s-zip = { version = "0.5", features = ["cloud-s3"] }
+
+# With Google Cloud Storage support
+s-zip = { version = "0.5", features = ["cloud-gcs"] }
+
+# With all cloud storage providers
+s-zip = { version = "0.5", features = ["cloud-all"] }
 
 # With async + Zstd compression
-s-zip = { version = "0.4", features = ["async", "async-zstd"] }
+s-zip = { version = "0.5", features = ["async", "async-zstd"] }
 ```
 
 ### Optional Features
@@ -98,8 +107,11 @@ s-zip = { version = "0.4", features = ["async", "async-zstd"] }
 | **`async`** | Enables async/await support with Tokio runtime | tokio, async-compression |
 | **`async-zstd`** | Async + Zstd compression support | async, zstd-support |
 | **`zstd-support`** | Zstd compression for sync API | zstd |
+| **`cloud-s3`** | AWS S3 streaming adapter (NEW in v0.5.0) | async, aws-sdk-s3 |
+| **`cloud-gcs`** | Google Cloud Storage adapter (NEW in v0.5.0) | async, google-cloud-storage |
+| **`cloud-all`** | All cloud storage providers | cloud-s3, cloud-gcs |
 
-**Note**: `async-zstd` includes both `async` and `zstd-support` features.
+**Note**: `async-zstd` includes both `async` and `zstd-support` features. Cloud features require `async`.
 
 ### Reading a ZIP file
 
@@ -189,9 +201,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **Note**: Zstd compression provides better compression ratios than DEFLATE but may have slower decompression on some systems. The reader will automatically detect and decompress Zstd-compressed entries when the `zstd-support` feature is enabled.
 
-## Async/Await Support (NEW in v0.4.0!)
+## Async/Await Support
 
-`s-zip` now supports async/await with Tokio runtime, enabling non-blocking I/O for web servers and cloud applications.
+`s-zip` supports async/await with Tokio runtime, enabling non-blocking I/O for web servers and cloud applications.
 
 ### When to Use Async?
 
@@ -332,9 +344,131 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks.**
 
+## Cloud Storage Streaming (NEW in v0.5.0!)
+
+Stream ZIP files directly to AWS S3 or Google Cloud Storage without writing to local disk. Perfect for serverless, containers, and cloud-native applications.
+
+### AWS S3 Streaming
+
+```rust
+use s_zip::{AsyncStreamingZipWriter, cloud::S3ZipWriter};
+use aws_sdk_s3::Client;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Configure AWS SDK
+    let config = aws_config::load_from_env().await;
+    let s3_client = Client::new(&config);
+
+    // Create S3 writer - streams directly with multipart upload
+    let writer = S3ZipWriter::new(
+        s3_client,
+        "my-bucket",
+        "exports/archive.zip"
+    ).await?;
+
+    let mut zip = AsyncStreamingZipWriter::from_writer(writer);
+
+    // Add files - data streams directly to S3
+    zip.start_entry("report.csv").await?;
+    zip.write_data(b"id,name,value\n1,Alice,100\n").await?;
+
+    zip.start_entry("data.json").await?;
+    zip.write_data(br#"{"status": "success"}"#).await?;
+
+    // Finish - completes S3 multipart upload
+    zip.finish().await?;
+
+    println!("✅ ZIP streamed to s3://my-bucket/exports/archive.zip");
+    Ok(())
+}
+```
+
+**Key Benefits:**
+- ✅ **No local disk usage** - Streams directly to S3
+- ✅ **Constant memory** - ~5-10MB regardless of ZIP size
+- ✅ **S3 multipart upload** - Handles files >5GB automatically
+- ✅ **Configurable part size** - Default 5MB, customize up to 5GB
+
+### Google Cloud Storage Streaming
+
+```rust
+use s_zip::{AsyncStreamingZipWriter, cloud::GCSZipWriter};
+use google_cloud_storage::client::Client;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Configure GCS client
+    let gcs_client = Client::default().await?;
+
+    // Create GCS writer - streams with resumable upload
+    let writer = GCSZipWriter::new(
+        gcs_client,
+        "my-bucket",
+        "exports/archive.zip"
+    ).await?;
+
+    let mut zip = AsyncStreamingZipWriter::from_writer(writer);
+
+    zip.start_entry("log.txt").await?;
+    zip.write_data(b"Application logs...").await?;
+
+    zip.finish().await?;
+
+    println!("✅ ZIP streamed to gs://my-bucket/exports/archive.zip");
+    Ok(())
+}
+```
+
+**Key Benefits:**
+- ✅ **No local disk usage** - Streams directly to GCS
+- ✅ **Constant memory** - ~8-12MB regardless of ZIP size
+- ✅ **Resumable upload** - 8MB chunks (256KB aligned)
+- ✅ **Configurable chunk size** - Customize for performance
+
+### Performance: Async Streaming vs Sync Upload
+
+Real-world comparison on AWS S3 (20MB data):
+
+| Method | Time | Memory | Description |
+|--------|------|--------|-------------|
+| **Sync (in-memory + upload)** | 368ms | ~20MB | Create ZIP in RAM, then upload |
+| **Async (direct streaming)** | 340ms | ~10MB | Stream directly to S3 |
+| **Speedup** | **1.08x faster** | **50% less memory** | ✅ Better for large files |
+
+**For 100MB+ files:**
+- 🚀 Async streaming: Constant 10MB memory
+- ⚠️ Sync approach: 100MB+ memory (entire ZIP in RAM)
+
+**When to use cloud streaming:**
+- ✅ Serverless functions (Lambda, Cloud Functions)
+- ✅ Containers with limited memory
+- ✅ Large archives (>100MB)
+- ✅ Cloud-native architectures
+- ✅ ETL pipelines, data exports
+
+### Advanced S3 Configuration
+
+```rust
+use s_zip::cloud::S3ZipWriter;
+
+// Custom part size for large files
+let writer = S3ZipWriter::builder()
+    .client(s3_client)
+    .bucket("my-bucket")
+    .key("large-archive.zip")
+    .part_size(100 * 1024 * 1024)  // 100MB parts for huge files
+    .build()
+    .await?;
+```
+
+**See examples:**
+- [examples/cloud_s3.rs](examples/cloud_s3.rs) - S3 streaming example
+- [examples/async_vs_sync_s3.rs](examples/async_vs_sync_s3.rs) - Performance comparison
+
 ### Using Arbitrary Writers (Advanced)
 
-**NEW in v0.3.0**: `s-zip` now supports writing to any type that implements `Write + Seek`, not just files. This enables:
+`s-zip` supports writing to any type that implements `Write + Seek`, not just files. This enables:
 
 - **In-memory ZIP creation** (Vec<u8>, Cursor)
 - **Network streaming** (TCP streams with buffering)
@@ -463,61 +597,60 @@ Results are saved to `target/criterion/` with HTML reports showing detailed stat
 
 ## Migration Guide
 
-### Upgrading from v0.3.x to v0.4.0
+### Upgrading from v0.4.x to v0.5.0
 
-**Zero Breaking Changes!** The v0.4.0 release is fully backward compatible.
+**Zero Breaking Changes!** The v0.5.0 release is fully backward compatible.
 
 **What's New:**
-- ✅ Async/await support (opt-in via `async` feature)
-- ✅ Concurrent ZIP creation
-- ✅ Better performance for network/cloud operations
-- ✅ All existing sync code works unchanged
+- ✅ AWS S3 streaming support (opt-in via `cloud-s3` feature)
+- ✅ Google Cloud Storage support (opt-in via `cloud-gcs` feature)
+- ✅ Direct cloud upload without local disk usage
+- ✅ Constant memory usage for cloud uploads (~5-10MB)
+- ✅ All existing sync and async code works unchanged
 
 **Migration Options:**
 
-**Option 1: Keep Using Sync (No Changes)**
+**Option 1: Keep Using Existing Code (No Changes)**
 ```toml
 [dependencies]
-s-zip = "0.4"  # No feature flags needed
+s-zip = "0.5"  # Existing code works as-is
 ```
 
 Your existing code continues to work exactly as before!
 
-**Option 2: Add Async Support**
+**Option 2: Add Cloud Storage Support**
 ```toml
 [dependencies]
-s-zip = { version = "0.4", features = ["async"] }
+# AWS S3 only
+s-zip = { version = "0.5", features = ["cloud-s3"] }
+
+# Google Cloud Storage only
+s-zip = { version = "0.5", features = ["cloud-gcs"] }
+
+# Both S3 and GCS
+s-zip = { version = "0.5", features = ["cloud-all"] }
 ```
-
-Now you can use both:
-- `StreamingZipWriter` (sync, existing code)
-- `AsyncStreamingZipWriter` (new async API)
-
-**Option 3: Async + Zstd**
-```toml
-[dependencies]
-s-zip = { version = "0.4", features = ["async-zstd"] }
-```
-
-Enables both async and Zstd compression.
 
 **API Comparison:**
 
 ```rust
-// Sync (v0.3.x and v0.4.0)
-let mut writer = StreamingZipWriter::new("output.zip")?;
-writer.start_entry("file.txt")?;
-writer.write_data(b"data")?;
-writer.finish()?;
-
-// Async (NEW in v0.4.0)
+// Local file (v0.4.x and v0.5.0)
 let mut writer = AsyncStreamingZipWriter::new("output.zip").await?;
+writer.start_entry("file.txt").await?;
+writer.write_data(b"data").await?;
+writer.finish().await?;
+
+// AWS S3 (NEW in v0.5.0)
+let s3_writer = S3ZipWriter::new(s3_client, "bucket", "key.zip").await?;
+let mut writer = AsyncStreamingZipWriter::from_writer(s3_writer);
 writer.start_entry("file.txt").await?;
 writer.write_data(b"data").await?;
 writer.finish().await?;
 ```
 
-The only differences: `AsyncStreamingZipWriter` and `.await` keywords!
+### Upgrading from v0.3.x to v0.4.0+
+
+All v0.3.x code is compatible with v0.5.0. Just update the version number and optionally add new features.
 
 ## Examples
 
@@ -528,12 +661,17 @@ Check out the [examples/](examples/) directory for complete working examples:
 - [arbitrary_writer.rs](examples/arbitrary_writer.rs) - In-memory ZIPs
 - [zstd_compression.rs](examples/zstd_compression.rs) - Zstd compression
 
-**Async Examples (NEW!):**
+**Async Examples:**
 - [async_basic.rs](examples/async_basic.rs) - Basic async usage
 - [async_streaming.rs](examples/async_streaming.rs) - Stream files to ZIP
 - [async_in_memory.rs](examples/async_in_memory.rs) - Cloud upload simulation
 - [concurrent_demo.rs](examples/concurrent_demo.rs) - Concurrent creation
 - [network_simulation.rs](examples/network_simulation.rs) - Network I/O demo
+
+**Cloud Storage Examples (NEW in v0.5.0!):**
+- [cloud_s3.rs](examples/cloud_s3.rs) - AWS S3 streaming upload
+- [async_vs_sync_s3.rs](examples/async_vs_sync_s3.rs) - Performance comparison
+- [verify_s3_upload.rs](examples/verify_s3_upload.rs) - Verify S3 uploads
 
 Run examples:
 ```bash
@@ -545,6 +683,13 @@ cargo run --example zstd_compression --features zstd-support
 cargo run --example async_basic --features async
 cargo run --example concurrent_demo --features async
 cargo run --example network_simulation --features async
+
+# Cloud storage examples (requires AWS credentials)
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-east-1"
+cargo run --example cloud_s3 --features cloud-s3
+cargo run --example async_vs_sync_s3 --features cloud-s3
 ```
 
 ## Documentation

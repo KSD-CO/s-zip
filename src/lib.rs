@@ -77,6 +77,9 @@ pub mod writer;
 #[cfg(feature = "async")]
 pub mod async_writer;
 
+#[cfg(any(feature = "cloud-s3", feature = "cloud-gcs"))]
+pub mod cloud;
+
 pub use error::{Result, SZipError};
 pub use reader::{StreamingZipReader, ZipEntry};
 pub use writer::{CompressionMethod, StreamingZipWriter};
