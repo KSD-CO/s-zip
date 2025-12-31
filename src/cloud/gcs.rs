@@ -183,7 +183,7 @@ impl GCSZipWriterBuilder {
     /// Panics if chunk_size is not a multiple of 256KB.
     pub fn chunk_size(mut self, chunk_size: usize) -> Self {
         assert!(
-            chunk_size % CHUNK_ALIGNMENT == 0,
+            chunk_size.is_multiple_of(CHUNK_ALIGNMENT),
             "Chunk size must be a multiple of 256KB"
         );
         self.chunk_size = chunk_size;
