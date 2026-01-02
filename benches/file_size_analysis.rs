@@ -1,4 +1,6 @@
-use s_zip::{CompressionMethod, StreamingZipWriter};
+#[cfg(feature = "zstd-support")]
+use s_zip::CompressionMethod;
+use s_zip::StreamingZipWriter;
 use std::fs;
 use tempfile::NamedTempFile;
 

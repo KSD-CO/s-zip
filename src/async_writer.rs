@@ -333,12 +333,18 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                     encoder: DeflateEncoder::with_quality(CompressedBuffer::new(), level),
                 })
             }
-            #[cfg(feature = "async-zstd")]
+            #[cfg(all(feature = "zstd-support", feature = "async-zstd"))]
             CompressionMethod::Zstd => {
                 let level = async_compression::Level::Precise(self.compression_level as i32);
                 Box::new(ZstdCompressor {
                     encoder: ZstdEncoder::with_quality(CompressedBuffer::new(), level),
                 })
+            }
+            #[cfg(all(feature = "zstd-support", not(feature = "async-zstd")))]
+            CompressionMethod::Zstd => {
+                return Err(SZipError::InvalidFormat(
+                    "Zstd compression requires 'async-zstd' feature".to_string(),
+                ));
             }
             CompressionMethod::Stored => {
                 return Err(SZipError::InvalidFormat(

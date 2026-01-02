@@ -5,6 +5,104 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-01-02
+
+### Fixed
+- **Compilation error** with specific feature combinations (e.g., `cloud-s3` without `zstd-support`)
+  - Fixed pattern matching for `CompressionMethod::Zstd` in async writer
+  - Added proper `#[cfg]` guards for conditional Zstd support
+- **Unused import warnings** in benchmark files when building without all features
+
+### Improved
+- **CI/CD robustness**: Added feature combination testing to `make ci`
+  - Now tests `async`, `cloud-s3`, and `cloud-gcs` features individually
+  - Prevents feature-specific compilation errors from slipping through
+- **Example configuration**: Added `required-features` to cloud storage examples in `Cargo.toml`
+  - `cloud_s3.rs`, `async_vs_sync_s3.rs`, `verify_s3_upload.rs` now require `cloud-s3` feature
+
+### Documentation
+- Removed outdated version markers ("NEW in v0.3.0", "NEW in v0.4.0") from README
+- Updated README to reflect current v0.5.x status
+
+## [0.5.0] - 2026-01-02
+
+### Added 🌩️
+
+- **AWS S3 cloud storage streaming** (NEW!)
+  - `S3ZipWriter`: Stream ZIP files directly to S3 without local disk
+  - S3 multipart upload support (5MB minimum part size, configurable)
+  - Constant memory usage (~5-10MB regardless of ZIP size)
+  - Background task pattern with async channels for non-blocking uploads
+  - Builder API for custom configuration (`S3ZipWriter::builder()`)
+
+- **Google Cloud Storage streaming** (NEW!)
+  - `GCSZipWriter`: Stream ZIP files directly to GCS without local disk
+  - Resumable upload support (8MB chunks, 256KB aligned)
+  - Constant memory usage (~8-12MB regardless of ZIP size)
+  - Configurable chunk size for performance tuning
+  - Builder API for custom configuration (`GCSZipWriter::builder()`)
+
+- **New feature flags**
+  - `cloud-s3`: Enables AWS S3 streaming adapter
+  - `cloud-gcs`: Enables Google Cloud Storage adapter
+  - `cloud-all`: Enables all cloud storage providers
+
+- **Cloud storage examples**
+  - `cloud_s3.rs`: AWS S3 streaming upload example
+  - `async_vs_sync_s3.rs`: Performance comparison (sync vs async streaming)
+  - `verify_s3_upload.rs`: Verify uploaded files on S3
+
+- **Performance metrics** for cloud streaming (tested with real S3, 20MB data):
+  - Sync (in-memory + upload): 368ms, ~20MB memory
+  - Async (direct streaming): 340ms, ~10MB memory
+  - **1.08x faster, 50% less memory** ✅
+
+### Changed
+
+- Enhanced README with comprehensive cloud storage documentation
+  - AWS S3 streaming examples
+  - Google Cloud Storage streaming examples
+  - Performance comparison tables
+  - When to use cloud streaming guide
+  - Advanced S3 configuration examples
+
+- Updated migration guide for v0.5.0
+  - Zero breaking changes
+  - Backward compatible with v0.4.x and v0.3.x
+  - Cloud features are opt-in
+
+### Dependencies
+
+**New optional dependencies:**
+- `aws-config ^1.5` (AWS SDK configuration)
+- `aws-sdk-s3 ^1.80` (AWS S3 client)
+- `google-cloud-storage ^0.22` (GCS client)
+- `google-cloud-auth ^0.17` (GCS authentication)
+
+All dependencies include `behavior-version-latest` feature to ensure compatibility.
+
+### Performance
+
+**Cloud Streaming Benefits:**
+- ✅ No local disk usage - streams directly to cloud
+- ✅ Constant memory usage regardless of file size
+- ✅ Better for serverless/Lambda (memory-constrained environments)
+- ✅ Faster for large files (>100MB) - pipelining compression + upload
+
+**When to use:**
+- Serverless functions (AWS Lambda, Cloud Functions)
+- Containers with limited memory
+- Large archives (>100MB)
+- Cloud-native architectures
+- ETL pipelines and data exports
+
+### Backward Compatibility ✅
+
+- **Zero breaking changes!**
+- All existing sync and async code works unchanged
+- Cloud storage support is opt-in via feature flags
+- Full API compatibility with v0.4.x
+
 ## [0.4.0] - 2024-12-30
 
 ### Added ⚡

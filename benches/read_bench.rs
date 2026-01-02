@@ -1,5 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use s_zip::{CompressionMethod, StreamingZipReader, StreamingZipWriter};
+#[cfg(feature = "zstd-support")]
+use s_zip::CompressionMethod;
+use s_zip::{StreamingZipReader, StreamingZipWriter};
 use std::io::Read;
 use tempfile::NamedTempFile;
 

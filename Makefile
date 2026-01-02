@@ -35,7 +35,14 @@ fmt-check:
 # Run clippy
 clippy:
 	@echo "🔍 Running clippy..."
+	@echo "  Checking with all features..."
 	@cargo clippy --all-targets --all-features -- -D warnings
+	@echo "  Checking async feature..."
+	@cargo clippy --all-targets --features async -- -D warnings
+	@echo "  Checking cloud-s3 feature..."
+	@cargo clippy --all-targets --features cloud-s3 -- -D warnings
+	@echo "  Checking cloud-gcs feature..."
+	@cargo clippy --all-targets --features cloud-gcs -- -D warnings
 
 # Run tests
 test:
