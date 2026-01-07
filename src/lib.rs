@@ -77,6 +77,9 @@ pub mod writer;
 #[cfg(feature = "async")]
 pub mod async_writer;
 
+#[cfg(feature = "async")]
+pub mod async_reader;
+
 #[cfg(any(feature = "cloud-s3", feature = "cloud-gcs"))]
 pub mod cloud;
 
@@ -86,3 +89,6 @@ pub use writer::{CompressionMethod, StreamingZipWriter};
 
 #[cfg(feature = "async")]
 pub use async_writer::AsyncStreamingZipWriter;
+
+#[cfg(feature = "async")]
+pub use async_reader::{AsyncStreamingZipReader, GenericAsyncZipReader};

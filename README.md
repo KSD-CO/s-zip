@@ -32,7 +32,8 @@ Most ZIP libraries assume small files or in-memory buffers.
 
 - **Streaming ZIP writer** (no full buffering)
 - **Async/await support** ⚡ Compatible with Tokio runtime
-- **Cloud storage adapters** 🌩️ NEW in v0.5.0! Stream directly to AWS S3 and Google Cloud Storage
+- **Async ZIP reader** 📖 NEW in v0.6.0! Stream ZIPs from any source (S3, HTTP, files)
+- **Cloud storage adapters** 🌩️ Stream directly to/from AWS S3 and Google Cloud Storage
 - **Arbitrary writer support** (File, Vec<u8>, network streams, etc.)
 - **Streaming ZIP reader** with minimal memory footprint
 - **ZIP64 support** for files >4GB
@@ -82,22 +83,22 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-s-zip = "0.5"
+s-zip = "0.6"
 
 # With async support (Tokio runtime)
-s-zip = { version = "0.5", features = ["async"] }
+s-zip = { version = "0.6", features = ["async"] }
 
 # With AWS S3 cloud storage support
-s-zip = { version = "0.5", features = ["cloud-s3"] }
+s-zip = { version = "0.6", features = ["cloud-s3"] }
 
 # With Google Cloud Storage support
-s-zip = { version = "0.5", features = ["cloud-gcs"] }
+s-zip = { version = "0.6", features = ["cloud-gcs"] }
 
 # With all cloud storage providers
-s-zip = { version = "0.5", features = ["cloud-all"] }
+s-zip = { version = "0.6", features = ["cloud-all"] }
 
 # With async + Zstd compression
-s-zip = { version = "0.5", features = ["async", "async-zstd"] }
+s-zip = { version = "0.6", features = ["async", "async-zstd"] }
 ```
 
 ### Optional Features
@@ -299,6 +300,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Async Reader
+
+Read ZIP files asynchronously with minimal memory usage. Supports reading from local files, S3, HTTP, or any `AsyncRead + AsyncSeek` source.
+
+```rust
+use s_zip::AsyncStreamingZipReader;
+use tokio::io::AsyncReadExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Open ZIP from local file
+    let mut reader = AsyncStreamingZipReader::open("archive.zip").await?;
+
+    // List all entries
+    for entry in reader.entries() {
+        println!("{}: {} bytes", entry.name, entry.uncompressed_size);
+    }
+
+    // Read a specific file into memory
+    let data = reader.read_entry_by_name("file.txt").await?;
+    println!("Content: {}", String::from_utf8_lossy(&data));
+
+    // Stream large files without loading into memory
+    let mut stream = reader.read_entry_streaming_by_name("large_file.bin").await?;
+    let mut buffer = vec![0u8; 8192];
+    
+    loop {
+        let n = stream.read(&mut buffer).await?;
+        if n == 0 { break; }
+        // Process chunk...
+    }
+
+    Ok(())
+}
+```
+
+### Reading from S3 (NEW in v0.6.0!)
+
+Read ZIP files directly from S3 without downloading to disk:
+
+```rust
+use s_zip::{GenericAsyncZipReader, cloud::S3ZipReader};
+use aws_sdk_s3::Client;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Configure AWS SDK
+    let config = aws_config::load_from_env().await;
+    let s3_client = Client::new(&config);
+
+    // Create S3 reader - streams directly from S3 using byte-range requests
+    let s3_reader = S3ZipReader::new(
+        s3_client,
+        "my-bucket",
+        "archives/data.zip"
+    ).await?;
+
+    // Wrap with GenericAsyncZipReader
+    let mut reader = GenericAsyncZipReader::new(s3_reader).await?;
+
+    // List entries
+    for entry in reader.entries() {
+        println!("📄 {}: {} bytes", entry.name, entry.uncompressed_size);
+    }
+
+    // Read specific file from S3 ZIP
+    let data = reader.read_entry_by_name("report.csv").await?;
+    println!("Downloaded {} bytes from S3 ZIP", data.len());
+
+    Ok(())
+}
+```
+
+**Key Benefits:**
+- ✅ **No local disk** - Reads directly from S3 using byte-range GET requests
+- ✅ **Constant memory** - ~5-10MB regardless of ZIP size
+- ✅ **Random access** - Jump to any file without downloading entire ZIP
+- ✅ **Generic API** - Works with any `AsyncRead + AsyncSeek` source (HTTP, in-memory, custom)
+
+**Performance Note:** For small files (<50MB), downloading the entire ZIP first is faster due to network latency. For large archives or when reading only a few files, streaming from S3 provides significant memory savings.
+
+### Reading from HTTP/Custom Sources
+
+The generic async reader works with any `AsyncRead + AsyncSeek` source:
+
+```rust
+use s_zip::GenericAsyncZipReader;
+use std::io::Cursor;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Example: In-memory ZIP (could be from HTTP response)
+    let zip_bytes = download_zip_from_http().await?;
+    let cursor = Cursor::new(zip_bytes);
+
+    // Read ZIP from in-memory source
+    let mut reader = GenericAsyncZipReader::new(cursor).await?;
+
+    for entry in reader.entries() {
+        println!("📦 {}", entry.name);
+    }
+
+    Ok(())
+}
+```
+
 ### Concurrent ZIP Creation
 
 Create multiple ZIPs simultaneously (5x faster than sequential):
@@ -344,11 +451,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks.**
 
-## Cloud Storage Streaming (NEW in v0.5.0!)
+## Cloud Storage Streaming
 
-Stream ZIP files directly to AWS S3 or Google Cloud Storage without writing to local disk. Perfect for serverless, containers, and cloud-native applications.
+Stream ZIP files directly to/from AWS S3 or Google Cloud Storage without writing to local disk. Perfect for serverless, containers, and cloud-native applications.
 
-### AWS S3 Streaming
+### AWS S3 Streaming (Write)
 
 ```rust
 use s_zip::{AsyncStreamingZipWriter, cloud::S3ZipWriter};
@@ -389,6 +496,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - ✅ **Constant memory** - ~5-10MB regardless of ZIP size
 - ✅ **S3 multipart upload** - Handles files >5GB automatically
 - ✅ **Configurable part size** - Default 5MB, customize up to 5GB
+
+### AWS S3 Streaming (Read - NEW in v0.6.0!)
+
+Read ZIP files directly from S3 without downloading:
+
+```rust
+use s_zip::{GenericAsyncZipReader, cloud::S3ZipReader};
+use aws_sdk_s3::Client;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = aws_config::load_from_env().await;
+    let s3_client = Client::new(&config);
+
+    // Read directly from S3 using byte-range requests
+    let s3_reader = S3ZipReader::new(s3_client, "bucket", "archive.zip").await?;
+    let mut reader = GenericAsyncZipReader::new(s3_reader).await?;
+
+    // Extract specific files without downloading entire ZIP
+    let data = reader.read_entry_by_name("report.csv").await?;
+    println!("Read {} bytes from S3", data.len());
+
+    Ok(())
+}
+```
+
+**Key Benefits:**
+- ✅ **No local download** - Uses S3 byte-range GET requests
+- ✅ **Constant memory** - ~5-10MB for any ZIP size
+- ✅ **Random access** - Read any file without downloading entire archive
+- ✅ **Cost effective** - Only transfer bytes you need
 
 ### Google Cloud Storage Streaming
 
@@ -597,6 +735,42 @@ Results are saved to `target/criterion/` with HTML reports showing detailed stat
 
 ## Migration Guide
 
+### Upgrading from v0.5.x to v0.6.0
+
+**Zero Breaking Changes!** The v0.6.0 release is fully backward compatible.
+
+**What's New:**
+- ✅ Generic async ZIP reader (`GenericAsyncZipReader<R>`)
+- ✅ Read ZIPs from any `AsyncRead + AsyncSeek` source (S3, HTTP, in-memory, files)
+- ✅ S3ZipReader for direct S3 streaming reads
+- ✅ Unified architecture - eliminated duplicate code
+- ✅ All existing sync and async code works unchanged
+
+**Migration:**
+
+```toml
+[dependencies]
+# Just update the version - existing code works as-is!
+s-zip = "0.6"
+
+# Or with features
+s-zip = { version = "0.6", features = ["async", "cloud-s3"] }
+```
+
+**New APIs (Optional):**
+
+```rust
+// v0.5.x - Still works!
+let mut reader = AsyncStreamingZipReader::open("file.zip").await?;
+
+// v0.6.0 - NEW: Read from S3
+let s3_reader = S3ZipReader::new(client, "bucket", "key").await?;
+let mut reader = GenericAsyncZipReader::new(s3_reader).await?;
+
+// v0.6.0 - NEW: Read from any source
+let mut reader = GenericAsyncZipReader::new(custom_reader).await?;
+```
+
 ### Upgrading from v0.4.x to v0.5.0
 
 **Zero Breaking Changes!** The v0.5.0 release is fully backward compatible.
@@ -634,13 +808,13 @@ s-zip = { version = "0.5", features = ["cloud-all"] }
 **API Comparison:**
 
 ```rust
-// Local file (v0.4.x and v0.5.0)
+// Local file (v0.4.x and later)
 let mut writer = AsyncStreamingZipWriter::new("output.zip").await?;
 writer.start_entry("file.txt").await?;
 writer.write_data(b"data").await?;
 writer.finish().await?;
 
-// AWS S3 (NEW in v0.5.0)
+// AWS S3 (v0.5.0+)
 let s3_writer = S3ZipWriter::new(s3_client, "bucket", "key.zip").await?;
 let mut writer = AsyncStreamingZipWriter::from_writer(s3_writer);
 writer.start_entry("file.txt").await?;
@@ -650,7 +824,7 @@ writer.finish().await?;
 
 ### Upgrading from v0.3.x to v0.4.0+
 
-All v0.3.x code is compatible with v0.5.0. Just update the version number and optionally add new features.
+All v0.3.x code is compatible with v0.6.0. Just update the version number and optionally add new features.
 
 ## Examples
 
@@ -665,12 +839,14 @@ Check out the [examples/](examples/) directory for complete working examples:
 - [async_basic.rs](examples/async_basic.rs) - Basic async usage
 - [async_streaming.rs](examples/async_streaming.rs) - Stream files to ZIP
 - [async_in_memory.rs](examples/async_in_memory.rs) - Cloud upload simulation
+- [async_reader_advanced.rs](examples/async_reader_advanced.rs) - Advanced async reading (NEW!)
+- [async_http_reader.rs](examples/async_http_reader.rs) - Read from HTTP/in-memory (NEW!)
 - [concurrent_demo.rs](examples/concurrent_demo.rs) - Concurrent creation
 - [network_simulation.rs](examples/network_simulation.rs) - Network I/O demo
 
-**Cloud Storage Examples (NEW in v0.5.0!):**
+**Cloud Storage Examples:**
 - [cloud_s3.rs](examples/cloud_s3.rs) - AWS S3 streaming upload
-- [async_vs_sync_s3.rs](examples/async_vs_sync_s3.rs) - Performance comparison
+- [async_vs_sync_s3.rs](examples/async_vs_sync_s3.rs) - Performance comparison (upload + download)
 - [verify_s3_upload.rs](examples/verify_s3_upload.rs) - Verify S3 uploads
 
 Run examples:

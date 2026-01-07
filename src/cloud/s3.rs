@@ -490,3 +490,210 @@ impl Drop for S3ZipWriter {
         // Users should ensure finish() is called properly
     }
 }
+
+// ============================================================================
+// S3 ZIP Reader
+// ============================================================================
+
+use tokio::io::AsyncRead;
+
+/// S3 ZIP reader that reads ZIP files directly from S3.
+///
+/// This reader implements `AsyncRead + AsyncSeek + Unpin + Send`, making it compatible
+/// with `GenericAsyncZipReader`.
+///
+/// ## Example
+///
+/// ```no_run
+/// use s_zip::{GenericAsyncZipReader, cloud::S3ZipReader};
+/// use aws_sdk_s3::Client;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = aws_config::load_from_env().await;
+/// let s3_client = Client::new(&config);
+///
+/// let reader = S3ZipReader::new(s3_client, "my-bucket", "archive.zip").await?;
+/// let mut zip = GenericAsyncZipReader::new(reader).await?;
+///
+/// // List entries
+/// for entry in zip.entries() {
+///     println!("{}: {} bytes", entry.name, entry.uncompressed_size);
+/// }
+///
+/// // Read a file
+/// let data = zip.read_entry_by_name("file.txt").await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct S3ZipReader {
+    client: Client,
+    bucket: String,
+    key: String,
+    position: u64,
+    size: u64,
+    #[allow(clippy::type_complexity)]
+    read_future: Option<Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>>,
+}
+
+impl S3ZipReader {
+    /// Create a new S3 ZIP reader.
+    ///
+    /// # Arguments
+    ///
+    /// * `client` - AWS S3 client
+    /// * `bucket` - S3 bucket name
+    /// * `key` - S3 object key (path)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use s_zip::cloud::S3ZipReader;
+    /// # use aws_sdk_s3::Client;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = aws_config::load_from_env().await;
+    /// let client = Client::new(&config);
+    ///
+    /// let reader = S3ZipReader::new(
+    ///     client,
+    ///     "my-bucket",
+    ///     "exports/archive.zip"
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn new(
+        client: Client,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Result<Self> {
+        let bucket = bucket.into();
+        let key = key.into();
+
+        // Get object metadata to determine size
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                SZipError::Io(io::Error::other(format!(
+                    "Failed to get S3 object metadata: {}",
+                    e
+                )))
+            })?;
+
+        let size = head
+            .content_length()
+            .ok_or_else(|| SZipError::Io(io::Error::other("S3 object has no content length")))?
+            as u64;
+
+        Ok(Self {
+            client,
+            bucket,
+            key,
+            position: 0,
+            size,
+            read_future: None,
+        })
+    }
+
+    /// Get the total size of the S3 object.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl AsyncRead for S3ZipReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // If we already have a pending future, poll it
+        if let Some(fut) = self.read_future.as_mut() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(bytes)) => {
+                    let n = bytes.len().min(buf.remaining());
+                    buf.put_slice(&bytes[..n]);
+                    self.position += n as u64;
+                    self.read_future = None;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Err(e)) => {
+                    self.read_future = None;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // Calculate byte range to read
+        let start = self.position;
+        let end = (start + buf.remaining() as u64 - 1).min(self.size - 1);
+
+        if start >= self.size {
+            return Poll::Ready(Ok(())); // EOF
+        }
+
+        let range = format!("bytes={}-{}", start, end);
+
+        // Create future for reading from S3
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key.clone();
+
+        let fut = Box::pin(async move {
+            let response = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .range(range)
+                .send()
+                .await
+                .map_err(|e| io::Error::other(format!("S3 GetObject failed: {}", e)))?;
+
+            let bytes = response
+                .body
+                .collect()
+                .await
+                .map_err(|e| io::Error::other(format!("Failed to read S3 body: {}", e)))?;
+
+            Ok::<_, io::Error>(bytes.into_bytes().to_vec())
+        });
+
+        // Store the future and poll it
+        self.read_future = Some(fut);
+
+        // Re-enter poll_read to poll the new future
+        self.poll_read(cx, buf)
+    }
+}
+
+impl AsyncSeek for S3ZipReader {
+    fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        let new_pos = match position {
+            io::SeekFrom::Start(pos) => pos as i64,
+            io::SeekFrom::End(offset) => self.size as i64 + offset,
+            io::SeekFrom::Current(offset) => self.position as i64 + offset,
+        };
+
+        if new_pos < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid seek position",
+            ));
+        }
+
+        self.position = new_pos as u64;
+        Ok(())
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(self.position))
+    }
+}
+
+impl Unpin for S3ZipReader {}
+
+unsafe impl Send for S3ZipReader {}

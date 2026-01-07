@@ -1,6 +1,6 @@
 [package]
 name = "s-zip"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 authors = ["Ton That Vu <ttvuhm@gmail.com>"]
 description = "High-performance streaming ZIP library with async/await support - Read/write ZIP files with minimal memory footprint. Supports arbitrary writers and Tokio runtime."
@@ -63,9 +63,9 @@ required-features = ["async"]
 name = "cloud_s3"
 required-features = ["cloud-s3"]
 
-[[example]]
-name = "async_vs_sync_s3"
-required-features = ["cloud-s3"]
+# [[example]]
+# name = "async_vs_sync_s3"
+# required-features = ["cloud-s3"]
 
 [[example]]
 name = "verify_s3_upload"

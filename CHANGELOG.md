@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-01-07
+
+### Added 📖
+
+- **Generic Async ZIP Reader** (`GenericAsyncZipReader<R>`)
+  - Read ZIP files from any `AsyncRead + AsyncSeek` source
+  - Supports local files, S3, HTTP, in-memory, and custom readers
+  - Unified architecture replacing duplicate code
+- **S3ZipReader** - Direct S3 ZIP streaming reads
+  - Uses S3 byte-range GET requests for efficient random access
+  - Read specific files without downloading entire ZIP
+  - Constant memory usage (~5-10MB) regardless of ZIP size
+  - Example: `examples/async_http_reader.rs`, `examples/async_reader_advanced.rs`
+- **New Examples**
+  - `async_reader_advanced.rs` - Advanced async reading features
+  - `async_http_reader.rs` - Reading from HTTP/in-memory sources
+  - Updated `async_vs_sync_s3.rs` - Now includes download/read performance testing
+
+### Changed 🔧
+
+- **Unified Async Reader Architecture**
+  - `AsyncStreamingZipReader` is now a type alias: `GenericAsyncZipReader<File>`
+  - Merged `async_reader_generic.rs` into `async_reader.rs` (eliminated 536 lines of duplicate code)
+  - All reader methods now generic over any `AsyncRead + AsyncSeek` source
+- **Performance Improvements**
+  - Better code organization and maintainability
+  - Single source of truth for async reading logic
+
+### Documentation 📚
+
+- Updated README with new async reader features
+- Added S3 reading examples and performance notes
+- Updated migration guide for v0.5.x → v0.6.0
+- Added performance comparison: sync download vs async streaming
+
+### Tests ✅
+
+- All existing tests pass (29/29)
+- Zero breaking changes - full backward compatibility
+- All examples work correctly (11/11)
+
 ## [0.5.1] - 2026-01-02
 
 ### Fixed

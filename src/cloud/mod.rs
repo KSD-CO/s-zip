@@ -35,7 +35,7 @@ pub mod s3;
 pub mod gcs;
 
 #[cfg(feature = "cloud-s3")]
-pub use s3::S3ZipWriter;
+pub use s3::{S3ZipReader, S3ZipWriter};
 
 #[cfg(feature = "cloud-gcs")]
 pub use gcs::GCSZipWriter;
