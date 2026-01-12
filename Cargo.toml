@@ -1,12 +1,12 @@
 [package]
 name = "s-zip"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Ton That Vu <ttvuhm@gmail.com>"]
-description = "High-performance streaming ZIP library with async/await support - Read/write ZIP files with minimal memory footprint. Supports arbitrary writers and Tokio runtime."
+description = "High-performance streaming ZIP library with AES-256 encryption and async/await support - Read/write ZIP files with minimal memory footprint. Supports password protection, cloud storage, and Tokio runtime."
 license = "MIT"
 repository = "https://github.com/KSD-CO/s-zip"
-keywords = ["zip", "streaming", "compression", "deflate", "archive"]
+keywords = ["zip", "streaming", "compression", "encryption", "archive"]
 categories = ["compression", "encoding", "filesystem"]
 readme = "README.md"
 
@@ -14,6 +14,13 @@ readme = "README.md"
 flate2 = "1.0"
 crc32fast = "1.4"
 zstd = { version = "0.13", optional = true }
+
+# Encryption dependencies (optional)
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+hmac = { version = "0.12", optional = true }
+sha1 = { version = "0.10", optional = true }
+pbkdf2 = { version = "0.12", optional = true, features = ["simple"] }
 
 # Async dependencies (optional)
 tokio = { version = "1.35", optional = true, features = ["io-util", "fs"] }
@@ -36,6 +43,7 @@ tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
 [features]
 default = []
 zstd-support = ["zstd"]
+encryption = ["aes", "ctr", "hmac", "sha1", "pbkdf2"]
 async = ["tokio", "async-compression", "futures-util", "pin-project-lite"]
 async-zstd = ["async", "zstd-support", "async-compression/zstd"]
 cloud-s3 = ["async", "aws-config", "aws-sdk-s3"]
@@ -58,6 +66,11 @@ harness = false
 name = "async_bench"
 harness = false
 required-features = ["async"]
+
+[[bench]]
+name = "encryption_bench"
+harness = false
+required-features = ["encryption"]
 
 [[example]]
 name = "cloud_s3"

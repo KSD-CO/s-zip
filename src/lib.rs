@@ -74,6 +74,9 @@ pub mod error;
 pub mod reader;
 pub mod writer;
 
+#[cfg(feature = "encryption")]
+pub mod encryption;
+
 #[cfg(feature = "async")]
 pub mod async_writer;
 
@@ -86,6 +89,9 @@ pub mod cloud;
 pub use error::{Result, SZipError};
 pub use reader::{StreamingZipReader, ZipEntry};
 pub use writer::{CompressionMethod, StreamingZipWriter};
+
+#[cfg(feature = "encryption")]
+pub use encryption::AesStrength;
 
 #[cfg(feature = "async")]
 pub use async_writer::AsyncStreamingZipWriter;

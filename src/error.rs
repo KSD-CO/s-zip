@@ -16,6 +16,12 @@ pub enum SZipError {
     EntryNotFound(String),
     /// Unsupported compression method
     UnsupportedCompression(u16),
+    /// Encryption/decryption error
+    #[cfg(feature = "encryption")]
+    EncryptionError(String),
+    /// Incorrect password
+    #[cfg(feature = "encryption")]
+    IncorrectPassword,
 }
 
 impl std::fmt::Display for SZipError {
@@ -27,6 +33,10 @@ impl std::fmt::Display for SZipError {
             SZipError::UnsupportedCompression(method) => {
                 write!(f, "Unsupported compression method: {}", method)
             }
+            #[cfg(feature = "encryption")]
+            SZipError::EncryptionError(msg) => write!(f, "Encryption error: {}", msg),
+            #[cfg(feature = "encryption")]
+            SZipError::IncorrectPassword => write!(f, "Incorrect password"),
         }
     }
 }

@@ -31,6 +31,7 @@ Most ZIP libraries assume small files or in-memory buffers.
 ## Key Features
 
 - **Streaming ZIP writer** (no full buffering)
+- **AES-256 encryption** 🔐 NEW! Password-protect files with WinZip-compatible encryption
 - **Async/await support** ⚡ Compatible with Tokio runtime
 - **Async ZIP reader** 📖 NEW in v0.6.0! Stream ZIPs from any source (S3, HTTP, files)
 - **Cloud storage adapters** 🌩️ Stream directly to/from AWS S3 and Google Cloud Storage
@@ -83,28 +84,32 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-s-zip = "0.6"
+s-zip = "0.7"
+
+# With AES-256 encryption support
+s-zip = { version = "0.7", features = ["encryption"] }
 
 # With async support (Tokio runtime)
-s-zip = { version = "0.6", features = ["async"] }
+s-zip = { version = "0.7", features = ["async"] }
 
 # With AWS S3 cloud storage support
-s-zip = { version = "0.6", features = ["cloud-s3"] }
+s-zip = { version = "0.7", features = ["cloud-s3"] }
 
 # With Google Cloud Storage support
-s-zip = { version = "0.6", features = ["cloud-gcs"] }
+s-zip = { version = "0.7", features = ["cloud-gcs"] }
 
 # With all cloud storage providers
-s-zip = { version = "0.6", features = ["cloud-all"] }
+s-zip = { version = "0.7", features = ["cloud-all"] }
 
-# With async + Zstd compression
-s-zip = { version = "0.6", features = ["async", "async-zstd"] }
+# With async + Zstd compression + encryption
+s-zip = { version = "0.7", features = ["async", "async-zstd", "encryption"] }
 ```
 
 ### Optional Features
 
 | Feature | Description | Dependencies |
 |---------|-------------|--------------|
+| **`encryption`** | AES-256 encryption support (NEW!) | aes, ctr, hmac, sha1, pbkdf2 |
 | **`async`** | Enables async/await support with Tokio runtime | tokio, async-compression |
 | **`async-zstd`** | Async + Zstd compression support | async, zstd-support |
 | **`zstd-support`** | Zstd compression for sync API | zstd |
@@ -201,6 +206,112 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 **Note**: Zstd compression provides better compression ratios than DEFLATE but may have slower decompression on some systems. The reader will automatically detect and decompress Zstd-compressed entries when the `zstd-support` feature is enabled.
+
+## Password Protection / AES-256 Encryption
+
+`s-zip` supports **WinZip-compatible AES-256 encryption** to password-protect sensitive files in your ZIP archives. This feature is perfect for securing confidential data, credentials, or any sensitive information.
+
+### Encryption Features
+
+- 🔐 **AES-256-CTR encryption** - Industry-standard strongest encryption
+- 🔑 **PBKDF2-HMAC-SHA1** key derivation (1000 iterations)
+- ✅ **HMAC-SHA1 authentication** - Detects tampering and incorrect passwords
+- 🌐 **WinZip AE-2 format** - Compatible with 7-Zip, WinZip, WinRAR, etc.
+- 📁 **Per-file passwords** - Different passwords for different files in same archive
+- 🚀 **Streaming encryption** - Encrypt on-the-fly with constant memory usage
+
+### Basic Encryption Example
+
+```rust
+use s_zip::StreamingZipWriter;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = StreamingZipWriter::new("encrypted.zip")?;
+
+    // Set password for encryption (requires 'encryption' feature)
+    writer.set_password("my_secure_password_123");
+
+    // All subsequent files will be encrypted
+    writer.start_entry("confidential.txt")?;
+    writer.write_data(b"Top secret information")?;
+
+    writer.start_entry("passwords.txt")?;
+    writer.write_data(b"Database credentials")?;
+
+    // Clear password to add unencrypted files
+    writer.clear_password();
+    writer.start_entry("readme.txt")?;
+    writer.write_data(b"Public information")?;
+
+    writer.finish()?;
+    Ok(())
+}
+```
+
+### Multiple Passwords in One Archive
+
+You can use different passwords for different files in the same ZIP:
+
+```rust
+let mut writer = StreamingZipWriter::new("mixed.zip")?;
+
+// Financial files with one password
+writer.set_password("finance_2024");
+writer.start_entry("salary_report.txt")?;
+writer.write_data(b"Employee salaries...")?;
+
+// Legal files with different password
+writer.set_password("legal_secure");
+writer.start_entry("contracts/agreement.pdf")?;
+writer.write_data(b"Contract data...")?;
+
+// Public files without password
+writer.clear_password();
+writer.start_entry("public_info.txt")?;
+writer.write_data(b"Public data...")?;
+
+writer.finish()?;
+```
+
+### Security Specifications
+
+- **Encryption**: AES-256-CTR (Counter mode)
+- **Key Derivation**: PBKDF2-HMAC-SHA1 with 1000 iterations
+- **Salt**: 16 bytes (randomly generated per file)
+- **Authentication**: HMAC-SHA1 (10-byte authentication code)
+- **Format**: WinZip AE-2 (no CRC for better security)
+- **Compatibility**: Works with 7-Zip, WinZip, WinRAR, Info-ZIP (with AES support)
+
+### Security Best Practices
+
+1. **Use strong passwords**: Minimum 12 characters with mixed case, numbers, symbols
+2. **Different passwords for different security levels**: Don't reuse passwords across files
+3. **Store passwords securely**: Use environment variables or secret management systems
+4. **Verify integrity**: The HMAC authentication ensures files haven't been tampered with
+
+### Performance Impact
+
+Encryption adds overhead but maintains constant memory usage:
+
+| File Size | Overhead | Throughput | Notes |
+|-----------|----------|------------|-------|
+| 1 KB | ~80x slower | 8-10 MiB/s | Dominated by key derivation (~950µs) |
+| 100 KB | ~23x slower | 20-23 MiB/s | Stable encryption overhead |
+| 1 MB+ | ~24-31x slower | 17-23 MiB/s | Network/disk I/O becomes bottleneck |
+
+**Memory usage**: ✅ **No impact** - maintains constant 2-5 MB streaming architecture
+
+**Best for**: Backend services, large files, cloud storage (where network is the bottleneck)
+
+**Considerations**: Real-time applications with <100ms latency requirements
+
+📊 See [ENCRYPTION_PERFORMANCE.md](ENCRYPTION_PERFORMANCE.md) for detailed benchmarks
+
+### Decryption Support
+
+Currently, **decryption is not yet implemented** in the reader. This is planned for future releases. For now, you can extract encrypted ZIPs using:
+- 7-Zip: `7z x encrypted.zip`
+- WinZip, WinRAR, or other tools that support WinZip AE-2 format
 
 ## Async/Await Support
 
@@ -735,6 +846,44 @@ Results are saved to `target/criterion/` with HTML reports showing detailed stat
 
 ## Migration Guide
 
+### Upgrading from v0.6.x to v0.7.0
+
+**Zero Breaking Changes!** The v0.7.0 release is fully backward compatible.
+
+**What's New:**
+- 🔐 **AES-256 encryption support** (opt-in via `encryption` feature)
+- 🔑 Password-protect files with WinZip-compatible AE-2 format
+- 🚀 Streaming encryption with constant memory usage (~2-5 MB)
+- 📁 Per-file passwords in same archive
+- ✅ All existing code works unchanged
+
+**Migration:**
+
+```toml
+[dependencies]
+# Just update the version - existing code works as-is!
+s-zip = "0.7"
+
+# Or add encryption support
+s-zip = { version = "0.7", features = ["encryption"] }
+```
+
+**New APIs (Optional):**
+
+```rust
+// Enable encryption for files
+let mut writer = StreamingZipWriter::new("secure.zip")?;
+writer.set_password("my_password");
+writer.start_entry("confidential.txt")?;
+writer.write_data(b"Secret data")?;
+
+// Mix encrypted and unencrypted files
+writer.clear_password();
+writer.start_entry("public.txt")?;
+writer.write_data(b"Public data")?;
+writer.finish()?;
+```
+
 ### Upgrading from v0.5.x to v0.6.0
 
 **Zero Breaking Changes!** The v0.6.0 release is fully backward compatible.
@@ -751,10 +900,10 @@ Results are saved to `target/criterion/` with HTML reports showing detailed stat
 ```toml
 [dependencies]
 # Just update the version - existing code works as-is!
-s-zip = "0.6"
+s-zip = "0.7"
 
 # Or with features
-s-zip = { version = "0.6", features = ["async", "cloud-s3"] }
+s-zip = { version = "0.7", features = ["async", "cloud-s3"] }
 ```
 
 **New APIs (Optional):**
@@ -763,11 +912,11 @@ s-zip = { version = "0.6", features = ["async", "cloud-s3"] }
 // v0.5.x - Still works!
 let mut reader = AsyncStreamingZipReader::open("file.zip").await?;
 
-// v0.6.0 - NEW: Read from S3
+// v0.6.0+ - Read from S3
 let s3_reader = S3ZipReader::new(client, "bucket", "key").await?;
 let mut reader = GenericAsyncZipReader::new(s3_reader).await?;
 
-// v0.6.0 - NEW: Read from any source
+// v0.6.0+ - Read from any source
 let mut reader = GenericAsyncZipReader::new(custom_reader).await?;
 ```
 
@@ -824,7 +973,7 @@ writer.finish().await?;
 
 ### Upgrading from v0.3.x to v0.4.0+
 
-All v0.3.x code is compatible with v0.6.0. Just update the version number and optionally add new features.
+All v0.3.x code is compatible with v0.7.0. Just update the version number and optionally add new features.
 
 ## Examples
 
@@ -834,6 +983,10 @@ Check out the [examples/](examples/) directory for complete working examples:
 - [basic.rs](examples/basic.rs) - Simple ZIP creation
 - [arbitrary_writer.rs](examples/arbitrary_writer.rs) - In-memory ZIPs
 - [zstd_compression.rs](examples/zstd_compression.rs) - Zstd compression
+
+**Encryption Examples:**
+- [encryption_basic.rs](examples/encryption_basic.rs) - Basic password protection (NEW!)
+- [encryption_advanced.rs](examples/encryption_advanced.rs) - Multiple passwords per archive (NEW!)
 
 **Async Examples:**
 - [async_basic.rs](examples/async_basic.rs) - Basic async usage
@@ -854,6 +1007,10 @@ Run examples:
 # Sync examples
 cargo run --example basic
 cargo run --example zstd_compression --features zstd-support
+
+# Encryption examples
+cargo run --example encryption_basic --features encryption
+cargo run --example encryption_advanced --features encryption
 
 # Async examples
 cargo run --example async_basic --features async
