@@ -84,11 +84,48 @@ enum UploadCommand {
 }
 
 /// Builder for `S3ZipWriter` with configuration options.
+///
+/// Supports MinIO and other S3-compatible storage services by allowing
+/// custom endpoint URLs.
+///
+/// ## Using with MinIO
+///
+/// ```no_run
+/// # use s_zip::cloud::S3ZipWriter;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let writer = S3ZipWriter::builder()
+///     .endpoint_url("http://localhost:9000")
+///     .region("us-east-1")
+///     .bucket("my-bucket")
+///     .key("archive.zip")
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Using with Cloudflare R2
+///
+/// ```no_run
+/// # use s_zip::cloud::S3ZipWriter;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let writer = S3ZipWriter::builder()
+///     .endpoint_url("https://<account_id>.r2.cloudflarestorage.com")
+///     .bucket("my-bucket")
+///     .key("archive.zip")
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct S3ZipWriterBuilder {
-    client: Client,
+    client: Option<Client>,
     bucket: String,
     key: String,
     part_size: usize,
+    endpoint_url: Option<String>,
+    region: Option<String>,
+    force_path_style: bool,
 }
 
 impl S3ZipWriter {
@@ -148,18 +185,24 @@ impl S3ZipWriter {
     /// ```
     pub fn builder() -> S3ZipWriterBuilder {
         S3ZipWriterBuilder {
-            client: Client::from_conf(aws_sdk_s3::Config::builder().build()),
+            client: None,
             bucket: String::new(),
             key: String::new(),
             part_size: DEFAULT_PART_SIZE,
+            endpoint_url: None,
+            region: None,
+            force_path_style: false,
         }
     }
 }
 
 impl S3ZipWriterBuilder {
-    /// Set the S3 client.
+    /// Set a pre-configured S3 client.
+    ///
+    /// If not set, a client will be created automatically using environment
+    /// credentials and any configured endpoint/region.
     pub fn client(mut self, client: Client) -> Self {
-        self.client = client;
+        self.client = Some(client);
         self
     }
 
@@ -172,6 +215,60 @@ impl S3ZipWriterBuilder {
     /// Set the S3 object key (path).
     pub fn key(mut self, key: impl Into<String>) -> Self {
         self.key = key.into();
+        self
+    }
+
+    /// Set a custom endpoint URL for S3-compatible services.
+    ///
+    /// Use this for MinIO, Cloudflare R2, DigitalOcean Spaces, Backblaze B2,
+    /// Linode Object Storage, and other S3-compatible services.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use s_zip::cloud::S3ZipWriter;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // MinIO
+    /// let writer = S3ZipWriter::builder()
+    ///     .endpoint_url("http://localhost:9000")
+    ///     .bucket("my-bucket")
+    ///     .key("archive.zip")
+    ///     .build()
+    ///     .await?;
+    ///
+    /// // Cloudflare R2
+    /// let writer = S3ZipWriter::builder()
+    ///     .endpoint_url("https://account_id.r2.cloudflarestorage.com")
+    ///     .bucket("my-bucket")
+    ///     .key("archive.zip")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn endpoint_url(mut self, url: impl Into<String>) -> Self {
+        self.endpoint_url = Some(url.into());
+        self
+    }
+
+    /// Set the AWS region.
+    ///
+    /// For MinIO and some S3-compatible services, you may need to set this
+    /// to a specific value (e.g., "us-east-1").
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
+        self
+    }
+
+    /// Force path-style URLs instead of virtual-hosted style.
+    ///
+    /// Required for MinIO and some S3-compatible services that don't support
+    /// virtual-hosted style URLs (e.g., `http://endpoint/bucket/key` instead of
+    /// `http://bucket.endpoint/key`).
+    ///
+    /// Default: `false` (uses virtual-hosted style for AWS S3)
+    pub fn force_path_style(mut self, force: bool) -> Self {
+        self.force_path_style = force;
         self
     }
 
@@ -194,11 +291,40 @@ impl S3ZipWriterBuilder {
     }
 
     /// Build the S3 writer and start the background upload task.
+    ///
+    /// If no client was provided, one will be created using environment credentials
+    /// and any configured endpoint/region settings.
     pub async fn build(self) -> Result<S3ZipWriter> {
+        let client = match self.client {
+            Some(c) => c,
+            None => {
+                // Build client from configuration
+                let mut config_loader = aws_config::from_env();
+
+                if let Some(ref endpoint) = self.endpoint_url {
+                    config_loader = config_loader.endpoint_url(endpoint);
+                }
+
+                if let Some(ref region) = self.region {
+                    config_loader = config_loader.region(aws_config::Region::new(region.clone()));
+                }
+
+                let sdk_config = config_loader.load().await;
+
+                let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
+
+                if self.force_path_style {
+                    s3_config = s3_config.force_path_style(true);
+                }
+
+                Client::from_conf(s3_config.build())
+            }
+        };
+
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Spawn background task for uploading parts
-        let upload_task = tokio::spawn(upload_worker(self.client, self.bucket, self.key, rx));
+        let upload_task = tokio::spawn(upload_worker(client, self.bucket, self.key, rx));
 
         Ok(S3ZipWriter {
             upload_tx: tx,
@@ -535,6 +661,34 @@ pub struct S3ZipReader {
     read_future: Option<Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>>,
 }
 
+/// Builder for `S3ZipReader` with configuration options.
+///
+/// Supports MinIO and other S3-compatible storage services.
+///
+/// ## Using with MinIO
+///
+/// ```no_run
+/// # use s_zip::cloud::S3ZipReader;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let reader = S3ZipReader::builder()
+///     .endpoint_url("http://localhost:9000")
+///     .region("us-east-1")
+///     .bucket("my-bucket")
+///     .key("archive.zip")
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct S3ZipReaderBuilder {
+    client: Option<Client>,
+    bucket: String,
+    key: String,
+    endpoint_url: Option<String>,
+    region: Option<String>,
+    force_path_style: bool,
+}
+
 impl S3ZipReader {
     /// Create a new S3 ZIP reader.
     ///
@@ -566,14 +720,119 @@ impl S3ZipReader {
         bucket: impl Into<String>,
         key: impl Into<String>,
     ) -> Result<Self> {
-        let bucket = bucket.into();
-        let key = key.into();
+        Self::builder()
+            .client(client)
+            .bucket(bucket)
+            .key(key)
+            .build()
+            .await
+    }
+
+    /// Create a builder for configuring the S3 reader.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use s_zip::cloud::S3ZipReader;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Read from MinIO
+    /// let reader = S3ZipReader::builder()
+    ///     .endpoint_url("http://localhost:9000")
+    ///     .bucket("my-bucket")
+    ///     .key("archive.zip")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn builder() -> S3ZipReaderBuilder {
+        S3ZipReaderBuilder {
+            client: None,
+            bucket: String::new(),
+            key: String::new(),
+            endpoint_url: None,
+            region: None,
+            force_path_style: false,
+        }
+    }
+
+    /// Get the total size of the S3 object.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl S3ZipReaderBuilder {
+    /// Set a pre-configured S3 client.
+    pub fn client(mut self, client: Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Set the S3 bucket name.
+    pub fn bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.bucket = bucket.into();
+        self
+    }
+
+    /// Set the S3 object key (path).
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = key.into();
+        self
+    }
+
+    /// Set a custom endpoint URL for S3-compatible services.
+    ///
+    /// Use this for MinIO, Cloudflare R2, DigitalOcean Spaces, etc.
+    pub fn endpoint_url(mut self, url: impl Into<String>) -> Self {
+        self.endpoint_url = Some(url.into());
+        self
+    }
+
+    /// Set the AWS region.
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
+        self
+    }
+
+    /// Force path-style URLs instead of virtual-hosted style.
+    pub fn force_path_style(mut self, force: bool) -> Self {
+        self.force_path_style = force;
+        self
+    }
+
+    /// Build the S3 reader.
+    pub async fn build(self) -> Result<S3ZipReader> {
+        let client = match self.client {
+            Some(c) => c,
+            None => {
+                let mut config_loader = aws_config::from_env();
+
+                if let Some(ref endpoint) = self.endpoint_url {
+                    config_loader = config_loader.endpoint_url(endpoint);
+                }
+
+                if let Some(ref region) = self.region {
+                    config_loader = config_loader.region(aws_config::Region::new(region.clone()));
+                }
+
+                let sdk_config = config_loader.load().await;
+
+                let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
+
+                if self.force_path_style {
+                    s3_config = s3_config.force_path_style(true);
+                }
+
+                Client::from_conf(s3_config.build())
+            }
+        };
 
         // Get object metadata to determine size
         let head = client
             .head_object()
-            .bucket(&bucket)
-            .key(&key)
+            .bucket(&self.bucket)
+            .key(&self.key)
             .send()
             .await
             .map_err(|e| {
@@ -588,19 +847,14 @@ impl S3ZipReader {
             .ok_or_else(|| SZipError::Io(io::Error::other("S3 object has no content length")))?
             as u64;
 
-        Ok(Self {
+        Ok(S3ZipReader {
             client,
-            bucket,
-            key,
+            bucket: self.bucket,
+            key: self.key,
             position: 0,
             size,
             read_future: None,
         })
-    }
-
-    /// Get the total size of the S3 object.
-    pub fn size(&self) -> u64 {
-        self.size
     }
 }
 

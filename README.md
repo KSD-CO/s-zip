@@ -33,8 +33,8 @@ Most ZIP libraries assume small files or in-memory buffers.
 - **Streaming ZIP writer** (no full buffering)
 - **AES-256 encryption** 🔐 NEW! Password-protect files with WinZip-compatible encryption
 - **Async/await support** ⚡ Compatible with Tokio runtime
-- **Async ZIP reader** 📖 NEW in v0.6.0! Stream ZIPs from any source (S3, HTTP, files)
-- **Cloud storage adapters** 🌩️ Stream directly to/from AWS S3 and Google Cloud Storage
+- **Async ZIP reader** 📖 Stream ZIPs from any source (S3, HTTP, files)
+- **Cloud storage adapters** 🌩️ Stream directly to/from AWS S3, Google Cloud Storage, MinIO, and S3-compatible services
 - **Arbitrary writer support** (File, Vec<u8>, network streams, etc.)
 - **Streaming ZIP reader** with minimal memory footprint
 - **ZIP64 support** for files >4GB
@@ -113,8 +113,8 @@ s-zip = { version = "0.7", features = ["async", "async-zstd", "encryption"] }
 | **`async`** | Enables async/await support with Tokio runtime | tokio, async-compression |
 | **`async-zstd`** | Async + Zstd compression support | async, zstd-support |
 | **`zstd-support`** | Zstd compression for sync API | zstd |
-| **`cloud-s3`** | AWS S3 streaming adapter (NEW in v0.5.0) | async, aws-sdk-s3 |
-| **`cloud-gcs`** | Google Cloud Storage adapter (NEW in v0.5.0) | async, google-cloud-storage |
+| **`cloud-s3`** | AWS S3 + MinIO + S3-compatible services | async, aws-sdk-s3 |
+| **`cloud-gcs`** | Google Cloud Storage adapter | async, google-cloud-storage |
 | **`cloud-all`** | All cloud storage providers | cloud-s3, cloud-gcs |
 
 **Note**: `async-zstd` includes both `async` and `zstd-support` features. Cloud features require `async`.
@@ -696,6 +696,61 @@ Real-world comparison on AWS S3 (20MB data):
 - ✅ Cloud-native architectures
 - ✅ ETL pipelines, data exports
 
+### MinIO / S3-Compatible Services (NEW in v0.7.0!)
+
+Stream ZIPs directly to MinIO, Cloudflare R2, DigitalOcean Spaces, Backblaze B2, and other S3-compatible services:
+
+```rust
+use s_zip::{AsyncStreamingZipWriter, cloud::S3ZipWriter};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Write to MinIO
+    let writer = S3ZipWriter::builder()
+        .endpoint_url("http://localhost:9000")
+        .region("us-east-1")
+        .bucket("my-bucket")
+        .key("archive.zip")
+        .force_path_style(true)  // Required for MinIO
+        .build()
+        .await?;
+
+    let mut zip = AsyncStreamingZipWriter::from_writer(writer);
+    zip.start_entry("data.txt").await?;
+    zip.write_data(b"Hello MinIO!").await?;
+    zip.finish().await?;
+
+    println!("✅ ZIP streamed to MinIO");
+    Ok(())
+}
+```
+
+**Read from MinIO:**
+
+```rust
+use s_zip::{GenericAsyncZipReader, cloud::S3ZipReader};
+
+let reader = S3ZipReader::builder()
+    .endpoint_url("http://localhost:9000")
+    .bucket("my-bucket")
+    .key("archive.zip")
+    .build()
+    .await?;
+
+let mut zip = GenericAsyncZipReader::new(reader).await?;
+let data = zip.read_entry_by_name("data.txt").await?;
+```
+
+**Supported S3-Compatible Services:**
+
+| Service | Endpoint Example |
+|---------|------------------|
+| **MinIO** | `http://localhost:9000` |
+| **Cloudflare R2** | `https://<account_id>.r2.cloudflarestorage.com` |
+| **DigitalOcean Spaces** | `https://<region>.digitaloceanspaces.com` |
+| **Backblaze B2** | `https://s3.<region>.backblazeb2.com` |
+| **Linode Object Storage** | `https://<region>.linodeobjects.com` |
+
 ### Advanced S3 Configuration
 
 ```rust
@@ -707,6 +762,15 @@ let writer = S3ZipWriter::builder()
     .bucket("my-bucket")
     .key("large-archive.zip")
     .part_size(100 * 1024 * 1024)  // 100MB parts for huge files
+    .build()
+    .await?;
+
+// Or with custom endpoint for S3-compatible services
+let writer = S3ZipWriter::builder()
+    .endpoint_url("https://s3.us-west-001.backblazeb2.com")
+    .region("us-west-001")
+    .bucket("my-bucket")
+    .key("archive.zip")
     .build()
     .await?;
 ```
