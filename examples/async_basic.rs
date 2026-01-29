@@ -15,7 +15,6 @@ async fn main() -> Result<()> {
 
     // Create async writer
     let mut writer = AsyncStreamingZipWriter::new("async_example.zip").await?;
-
     // Add first entry
     writer.start_entry("hello.txt").await?;
     writer.write_data(b"Hello, async world!").await?;

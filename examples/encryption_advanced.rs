@@ -5,9 +5,22 @@
 //!
 //! Run with: cargo run --example encryption_advanced --features encryption
 
-use s_zip::{Result, StreamingZipWriter};
+#[cfg(not(feature = "encryption"))]
+fn main() {
+    eprintln!("This example requires the 'encryption' feature.");
+    eprintln!("Run with: cargo run --example encryption_advanced --features encryption");
+    std::process::exit(1);
+}
 
-fn main() -> Result<()> {
+#[cfg(feature = "encryption")]
+fn main() -> s_zip::Result<()> {
+    run_example()
+}
+
+#[cfg(feature = "encryption")]
+fn run_example() -> s_zip::Result<()> {
+    use s_zip::StreamingZipWriter;
+
     println!("Creating ZIP with multiple passwords and mixed encryption...\n");
 
     // Create a new ZIP writer

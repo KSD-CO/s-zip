@@ -5,3 +5,4 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+OPTIMIZATION_PROPOSAL.md
