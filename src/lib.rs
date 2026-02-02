@@ -83,6 +83,9 @@ pub mod async_writer;
 #[cfg(feature = "async")]
 pub mod async_reader;
 
+#[cfg(feature = "async")]
+pub mod parallel;
+
 #[cfg(any(feature = "cloud-s3", feature = "cloud-gcs"))]
 pub mod cloud;
 
@@ -98,3 +101,6 @@ pub use async_writer::AsyncStreamingZipWriter;
 
 #[cfg(feature = "async")]
 pub use async_reader::{AsyncStreamingZipReader, GenericAsyncZipReader};
+
+#[cfg(feature = "async")]
+pub use parallel::{ParallelConfig, ParallelEntry};

@@ -1,6 +1,6 @@
 [package]
 name = "s-zip"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 authors = ["Ton That Vu <ttvuhm@gmail.com>"]
 description = "High-performance streaming ZIP library with AES-256 encryption and async/await support - Read/write ZIP files with minimal memory footprint. Supports password protection, cloud storage, and Tokio runtime."
@@ -23,7 +23,7 @@ sha1 = { version = "0.10", optional = true }
 pbkdf2 = { version = "0.12", optional = true, features = ["simple"] }
 
 # Async dependencies (optional)
-tokio = { version = "1.35", optional = true, features = ["io-util", "fs"] }
+tokio = { version = "1.35", optional = true, features = ["io-util", "fs", "sync", "rt"] }
 async-compression = { version = "0.4", optional = true, features = ["tokio", "deflate", "zstd"] }
 futures-util = { version = "0.3", optional = true }
 pin-project-lite = { version = "0.2", optional = true }
