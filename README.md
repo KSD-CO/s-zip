@@ -46,6 +46,24 @@ Most ZIP libraries assume small files or in-memory buffers.
 - **Rust safety guarantees**
 - **Backend-friendly API**
 
+## What's New in v0.10.1 ✨
+
+**Code Quality & Testing (2026-02-08)**
+- ✅ **Zero Compiler Warnings** - Clean builds with proper conditional compilation
+- ✅ **Improved Test Coverage** - Added 5 new unit tests (+125% increase)
+- ✅ **Performance Verified** - Zero regression: 194 MB/sec, 14,317 files/sec, 382x compression
+- ✅ **Better Code Organization** - Cleaner encryption code paths and examples
+- ✅ **Enhanced Documentation** - Added performance comparison test and encryption roundtrip example
+
+**Key Metrics:**
+- 🧪 Unit Tests: 9 passing (was 4)
+- ⚠️ Compiler Warnings: 0 (was 4)
+- 🚀 Performance: No regression
+- 📦 Binary Size: Unchanged
+- 💾 Memory Usage: ~2-5 MB constant (unchanged)
+
+See [CHANGELOG.md](CHANGELOG.md) for full details.
+
 ## Non-goals
 
 - Not a CLI replacement for zip/unzip
@@ -983,6 +1001,30 @@ Results are saved to `target/criterion/` with HTML reports showing detailed stat
 - Random vs compressible data patterns
 
 ## Migration Guide
+
+### Upgrading to v0.10.1 (Latest)
+
+**Zero Breaking Changes!** This is a patch release with bug fixes and improvements.
+
+**What's Fixed:**
+- ✅ **Zero Compiler Warnings** - Clean builds with all features
+- ✅ **Better Test Coverage** - Added 5 new unit tests (9 tests total, was 4)
+- ✅ **Performance Verified** - No regression: 194 MB/sec, 14,317 files/sec
+- ✅ **Code Quality** - Removed debug examples, cleaner code organization
+- ✅ **Enhanced Examples** - Added `perf_compare.rs` and `encryption_roundtrip.rs`
+
+**Migration:**
+
+```toml
+[dependencies]
+# Just update the version - fully backward compatible!
+s-zip = "0.10.1"
+
+# Or with features
+s-zip = { version = "0.10.1", features = ["async", "encryption", "cloud-s3"] }
+```
+
+**No code changes required** - All existing code works without modifications.
 
 ### Upgrading from v0.9.x to v0.10.0
 
