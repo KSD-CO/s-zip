@@ -130,17 +130,21 @@ mod tests {
         let zip_bytes = cursor.into_inner();
 
         // Verify ZIP was created
-        assert!(zip_bytes.len() > 0, "ZIP should not be empty");
+        assert!(!zip_bytes.is_empty(), "ZIP should not be empty");
 
         // Verify ZIP has correct signature
-        assert_eq!(&zip_bytes[0..4], b"PK\x03\x04", "Should start with ZIP signature");
+        assert_eq!(
+            &zip_bytes[0..4],
+            b"PK\x03\x04",
+            "Should start with ZIP signature"
+        );
     }
 
     #[test]
     fn test_compression_method_to_zip_method() {
         assert_eq!(CompressionMethod::Stored.to_zip_method(), 0);
         assert_eq!(CompressionMethod::Deflate.to_zip_method(), 8);
-        
+
         #[cfg(feature = "zstd-support")]
         assert_eq!(CompressionMethod::Zstd.to_zip_method(), 93);
     }
@@ -165,7 +169,7 @@ mod tests {
         for i in 0..10 {
             let entry_name = format!("file_{}.txt", i);
             let entry_data = format!("Content of file {}", i);
-            
+
             writer.start_entry(&entry_name).unwrap();
             writer.write_data(entry_data.as_bytes()).unwrap();
         }

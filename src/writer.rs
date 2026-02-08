@@ -538,20 +538,21 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             // Flush buffer to output to keep memory usage low
             let compressed_data = buffer.take();
 
-            // Encrypt compressed data if encryption is enabled
+            // Encrypt compressed data if encryption is enabled and password is set
             #[cfg(feature = "encryption")]
-            if let Some(ref mut encryptor) = entry.encryptor {
+            let data_to_write = if let Some(ref mut encryptor) = entry.encryptor {
                 let mut data_to_encrypt = compressed_data;
                 encryptor.encrypt(&mut data_to_encrypt)?;
-                self.output.write_all(&data_to_encrypt)?;
-                entry.counter.add_compressed(data_to_encrypt.len() as u64);
-            }
+                data_to_encrypt
+            } else {
+                compressed_data
+            };
 
             #[cfg(not(feature = "encryption"))]
-            {
-                self.output.write_all(&compressed_data)?;
-                entry.counter.add_compressed(compressed_data.len() as u64);
-            }
+            let data_to_write = compressed_data;
+
+            self.output.write_all(&data_to_write)?;
+            entry.counter.add_compressed(data_to_write.len() as u64);
         }
 
         Ok(())
@@ -566,20 +567,21 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             // Flush any remaining data from buffer to output
             let remaining_data = buffer.take();
             if !remaining_data.is_empty() {
-                // Encrypt remaining compressed data if encryption is enabled
+                // Encrypt remaining compressed data if encryption is enabled and password is set
                 #[cfg(feature = "encryption")]
-                if let Some(ref mut encryptor) = entry.encryptor {
+                let data_to_write = if let Some(ref mut encryptor) = entry.encryptor {
                     let mut data_to_encrypt = remaining_data;
                     encryptor.encrypt(&mut data_to_encrypt)?;
-                    self.output.write_all(&data_to_encrypt)?;
-                    entry.counter.add_compressed(data_to_encrypt.len() as u64);
-                }
+                    data_to_encrypt
+                } else {
+                    remaining_data
+                };
 
                 #[cfg(not(feature = "encryption"))]
-                {
-                    self.output.write_all(&remaining_data)?;
-                    entry.counter.add_compressed(remaining_data.len() as u64);
-                }
+                let data_to_write = remaining_data;
+
+                self.output.write_all(&data_to_write)?;
+                entry.counter.add_compressed(data_to_write.len() as u64);
             }
 
             // Write authentication code for AES encryption

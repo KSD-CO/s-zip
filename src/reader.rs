@@ -675,6 +675,7 @@ impl StreamingZipReader {
 
     /// Parse AES encryption info from extra field
     #[cfg(feature = "encryption")]
+    #[allow(clippy::type_complexity)]
     fn parse_aes_extra_field(
         &mut self,
         extra_len: usize,

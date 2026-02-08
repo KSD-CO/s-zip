@@ -77,6 +77,10 @@ required-features = ["encryption"]
 name = "cloud_s3"
 required-features = ["cloud-s3"]
 
+[[example]]
+name = "encryption_roundtrip"
+required-features = ["encryption"]
+
 # [[example]]
 # name = "async_vs_sync_s3"
 # required-features = ["cloud-s3"]
