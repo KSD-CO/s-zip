@@ -108,6 +108,31 @@ impl CompressorWrite for DeflateCompressor {
     }
 }
 
+/// Stored (no compression) pass-through compressor
+struct StoredCompressor {
+    buffer: CompressedBuffer,
+}
+
+impl Write for StoredCompressor {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.buffer.flush()
+    }
+}
+
+impl CompressorWrite for StoredCompressor {
+    fn finish_compression(self: Box<Self>) -> Result<CompressedBuffer> {
+        Ok(self.buffer)
+    }
+
+    fn get_buffer_mut(&mut self) -> &mut CompressedBuffer {
+        &mut self.buffer
+    }
+}
+
 #[cfg(feature = "zstd-support")]
 struct ZstdCompressor {
     encoder: zstd::Encoder<'static, CompressedBuffer>,
@@ -455,18 +480,28 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
                 Box::new(ZstdCompressor { encoder })
             }
             CompressionMethod::Stored => {
-                // For stored, we don't compress
-                return Err(SZipError::InvalidFormat(
-                    "Stored method not yet implemented".to_string(),
-                ));
+                // Stored method: no compression, pass through data
+                Box::new(StoredCompressor {
+                    buffer: CompressedBuffer::new(),
+                })
             }
         };
+
+        #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
+        let mut counter = CrcCounter::new();
+
+        // Account for salt and password verify bytes in compressed size for encrypted entries
+        #[cfg(feature = "encryption")]
+        if let Some(ref enc) = encryptor {
+            let encryption_overhead = (enc.salt().len() + 2) as u64; // salt + password_verify
+            counter.add_compressed(encryption_overhead);
+        }
 
         self.current_entry = Some(CurrentEntry {
             name: name.to_string(),
             local_header_offset,
             encoder,
-            counter: CrcCounter::new(),
+            counter,
             compression_method,
             #[cfg(feature = "encryption")]
             encryptor,
@@ -485,22 +520,14 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         // Update CRC and size with uncompressed data
         entry.counter.update_uncompressed(data);
 
-        // For AES encryption: encrypt THEN compress
-        // Note: AE-2 format doesn't use CRC, uses HMAC instead
+        // For AES encryption: Update HMAC with plaintext BEFORE compression
         #[cfg(feature = "encryption")]
-        let data_to_compress = if let Some(ref mut encryptor) = entry.encryptor {
-            let mut encrypted = data.to_vec();
-            encryptor.encrypt(&mut encrypted)?;
-            encrypted
-        } else {
-            data.to_vec()
-        };
-
-        #[cfg(not(feature = "encryption"))]
-        let data_to_compress = data.to_vec();
+        if let Some(ref mut encryptor) = entry.encryptor {
+            encryptor.update_hmac(data);
+        }
 
         // Write to encoder (compresses data into buffer)
-        entry.encoder.write_all(&data_to_compress)?;
+        entry.encoder.write_all(data)?;
 
         // Flush encoder to ensure all data is in buffer
         entry.encoder.flush()?;
@@ -510,8 +537,21 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         if buffer.should_flush() {
             // Flush buffer to output to keep memory usage low
             let compressed_data = buffer.take();
-            self.output.write_all(&compressed_data)?;
-            entry.counter.add_compressed(compressed_data.len() as u64);
+
+            // Encrypt compressed data if encryption is enabled
+            #[cfg(feature = "encryption")]
+            if let Some(ref mut encryptor) = entry.encryptor {
+                let mut data_to_encrypt = compressed_data;
+                encryptor.encrypt(&mut data_to_encrypt)?;
+                self.output.write_all(&data_to_encrypt)?;
+                entry.counter.add_compressed(data_to_encrypt.len() as u64);
+            }
+
+            #[cfg(not(feature = "encryption"))]
+            {
+                self.output.write_all(&compressed_data)?;
+                entry.counter.add_compressed(compressed_data.len() as u64);
+            }
         }
 
         Ok(())
@@ -526,8 +566,20 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             // Flush any remaining data from buffer to output
             let remaining_data = buffer.take();
             if !remaining_data.is_empty() {
-                self.output.write_all(&remaining_data)?;
-                entry.counter.add_compressed(remaining_data.len() as u64);
+                // Encrypt remaining compressed data if encryption is enabled
+                #[cfg(feature = "encryption")]
+                if let Some(ref mut encryptor) = entry.encryptor {
+                    let mut data_to_encrypt = remaining_data;
+                    encryptor.encrypt(&mut data_to_encrypt)?;
+                    self.output.write_all(&data_to_encrypt)?;
+                    entry.counter.add_compressed(data_to_encrypt.len() as u64);
+                }
+
+                #[cfg(not(feature = "encryption"))]
+                {
+                    self.output.write_all(&remaining_data)?;
+                    entry.counter.add_compressed(remaining_data.len() as u64);
+                }
             }
 
             // Write authentication code for AES encryption
@@ -591,7 +643,18 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             self.output.write_all(&[0x50, 0x4b, 0x01, 0x02])?; // central dir sig
             self.output.write_all(&[20, 0])?; // version made by
             self.output.write_all(&[20, 0])?; // version needed
-            self.output.write_all(&[8, 0])?; // general purpose bit flag (bit 3 set)
+
+            // Set encryption flag (bit 0) if entry was encrypted
+            #[cfg(feature = "encryption")]
+            let flags = if entry.encryption_strength.is_some() {
+                0x08 | 0x01 // bit 3 (data descriptor) + bit 0 (encryption)
+            } else {
+                0x08 // bit 3 only (data descriptor)
+            };
+            #[cfg(not(feature = "encryption"))]
+            let flags = 0x08;
+
+            self.output.write_all(&[flags, 0])?; // general purpose bit flag
             self.output
                 .write_all(&entry.compression_method.to_le_bytes())?; // compression method
             self.output.write_all(&[0, 0, 0, 0])?; // mod time/date
@@ -615,8 +678,23 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             self.output
                 .write_all(&(entry.name.len() as u16).to_le_bytes())?;
 
-            // Prepare ZIP64 extra field if needed
+            // Prepare extra fields
             let mut extra_field: Vec<u8> = Vec::new();
+
+            // Add AES extra field if entry was encrypted
+            #[cfg(feature = "encryption")]
+            if let Some(strength_code) = entry.encryption_strength {
+                // AES extra field header (0x9901)
+                extra_field.extend_from_slice(&[0x01, 0x99]); // WinZip AES encryption marker
+                extra_field.extend_from_slice(&[7, 0]); // data size
+                extra_field.extend_from_slice(&[2, 0]); // AE-2 format
+                extra_field.extend_from_slice(&[0x41, 0x45]); // vendor ID "AE"
+                extra_field.extend_from_slice(&strength_code.to_le_bytes()); // strength
+                extra_field.extend_from_slice(&entry.compression_method.to_le_bytes());
+                // actual compression
+            }
+
+            // Add ZIP64 extra field if needed
             if entry.uncompressed_size > u32::MAX as u64
                 || entry.compressed_size > u32::MAX as u64
                 || entry.local_header_offset > u32::MAX as u64

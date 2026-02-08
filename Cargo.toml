@@ -21,6 +21,7 @@ ctr = { version = "0.9", optional = true }
 hmac = { version = "0.12", optional = true }
 sha1 = { version = "0.10", optional = true }
 pbkdf2 = { version = "0.12", optional = true, features = ["simple"] }
+getrandom = { version = "0.2", optional = true }
 
 # Async dependencies (optional)
 tokio = { version = "1.35", optional = true, features = ["io-util", "fs", "sync", "rt"] }
@@ -43,7 +44,7 @@ tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
 [features]
 default = []
 zstd-support = ["zstd"]
-encryption = ["aes", "ctr", "hmac", "sha1", "pbkdf2"]
+encryption = ["aes", "ctr", "hmac", "sha1", "pbkdf2", "getrandom"]
 async = ["tokio", "async-compression", "futures-util", "pin-project-lite"]
 async-zstd = ["async", "zstd-support", "async-compression/zstd"]
 cloud-s3 = ["async", "aws-config", "aws-sdk-s3"]

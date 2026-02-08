@@ -9,6 +9,9 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+#[cfg(feature = "encryption")]
+use crate::encryption::{AesDecryptor, AesStrength};
+
 /// ZIP local file header signature
 const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x04034b50;
 
@@ -31,12 +34,16 @@ pub struct ZipEntry {
     pub uncompressed_size: u64,
     pub compression_method: u16,
     pub offset: u64,
+    #[cfg(feature = "encryption")]
+    pub is_encrypted: bool,
 }
 
 /// Streaming ZIP archive reader with adaptive buffering
 pub struct StreamingZipReader {
     file: BufReader<File>,
     entries: Vec<ZipEntry>,
+    #[cfg(feature = "encryption")]
+    password: Option<String>,
 }
 
 impl StreamingZipReader {
@@ -77,7 +84,26 @@ impl StreamingZipReader {
         // Find and read central directory
         let entries = Self::read_central_directory(&mut file)?;
 
-        Ok(StreamingZipReader { file, entries })
+        Ok(StreamingZipReader {
+            file,
+            entries,
+            #[cfg(feature = "encryption")]
+            password: None,
+        })
+    }
+
+    /// Set password for decrypting encrypted entries
+    #[cfg(feature = "encryption")]
+    pub fn set_password(&mut self, password: impl Into<String>) -> &mut Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Clear password
+    #[cfg(feature = "encryption")]
+    pub fn clear_password(&mut self) -> &mut Self {
+        self.password = None;
+        self
     }
 
     /// Get list of all entries in the ZIP
@@ -103,8 +129,15 @@ impl StreamingZipReader {
             ));
         }
 
-        // Skip version, flags, compression method
-        self.file.seek(SeekFrom::Current(6))?;
+        // Skip version
+        self.file.seek(SeekFrom::Current(2))?;
+
+        // Read flags to check for encryption
+        let flags = self.read_u16_le()?;
+        let is_encrypted = (flags & 0x01) != 0;
+
+        // Read compression method
+        let _compression_method = self.read_u16_le()?;
 
         // Skip modification time and date, CRC-32
         self.file.seek(SeekFrom::Current(8))?;
@@ -114,17 +147,84 @@ impl StreamingZipReader {
 
         // Read filename length and extra field length
         let filename_len = self.read_u16_le()? as i64;
-        let extra_len = self.read_u16_le()? as i64;
+        let extra_len = self.read_u16_le()? as usize;
 
-        // Skip filename and extra field
-        self.file
-            .seek(SeekFrom::Current(filename_len + extra_len))?;
+        // Skip filename
+        self.file.seek(SeekFrom::Current(filename_len))?;
+
+        // Check for AES encryption in extra field
+        #[cfg(feature = "encryption")]
+        let encryption_info = if is_encrypted {
+            eprintln!(
+                "DEBUG: File position before parse_aes_extra_field: 0x{:x}",
+                self.file.stream_position()?
+            );
+            eprintln!("DEBUG: extra_len = {}", extra_len);
+            self.parse_aes_extra_field(extra_len)?
+        } else {
+            // Skip extra field if not encrypted
+            self.file.seek(SeekFrom::Current(extra_len as i64))?;
+            None
+        };
+
+        #[cfg(not(feature = "encryption"))]
+        {
+            if is_encrypted {
+                return Err(SZipError::InvalidFormat(
+                    "Encrypted entry found but encryption feature not enabled".to_string(),
+                ));
+            }
+            // Skip extra field
+            self.file.seek(SeekFrom::Current(extra_len as i64))?;
+        }
+
+        // Calculate actual data size (subtract salt, password verify, and auth code for encrypted entries)
+        #[cfg(feature = "encryption")]
+        let data_size = if let Some((strength, _, _)) = encryption_info {
+            // Subtract salt (already read), password verify (already read), and auth code (10 bytes at end)
+            entry
+                .compressed_size
+                .saturating_sub((strength.salt_size() + 2 + 10) as u64)
+        } else {
+            entry.compressed_size
+        };
+
+        #[cfg(not(feature = "encryption"))]
+        let data_size = entry.compressed_size;
 
         // Now read the compressed data
-        let mut compressed_data = vec![0u8; entry.compressed_size as usize];
+        let mut compressed_data = vec![0u8; data_size as usize];
         self.file.read_exact(&mut compressed_data)?;
 
-        // Decompress if needed
+        // Read auth code if encrypted
+        #[cfg(feature = "encryption")]
+        let auth_code = if encryption_info.is_some() {
+            let mut ac = vec![0u8; 10];
+            self.file.read_exact(&mut ac)?;
+            Some(ac)
+        } else {
+            None
+        };
+
+        // Decrypt if encrypted (Step 1: Decrypt compressed data)
+        #[cfg(feature = "encryption")]
+        let decryptor_opt = if let Some((strength, salt, pw_verify)) = encryption_info {
+            let password = self.password.as_ref().ok_or_else(|| {
+                SZipError::InvalidFormat("Encrypted entry but no password set".to_string())
+            })?;
+
+            // Create decryptor (password verification happens inside new())
+            let mut decryptor = AesDecryptor::new(password, strength, &salt, &pw_verify)?;
+
+            // Decrypt compressed data in-place
+            decryptor.decrypt(&mut compressed_data)?;
+
+            Some(decryptor)
+        } else {
+            None
+        };
+
+        // Decompress if needed (Step 2: Decompress decrypted data)
         let data = if entry.compression_method == 8 {
             // DEFLATE compression
             let mut decoder = DeflateDecoder::new(&compressed_data[..]);
@@ -147,6 +247,18 @@ impl StreamingZipReader {
         } else {
             return Err(SZipError::UnsupportedCompression(entry.compression_method));
         };
+
+        // Verify HMAC authentication (Step 3: Update HMAC with plaintext and verify)
+        #[cfg(feature = "encryption")]
+        if let Some(mut decryptor) = decryptor_opt {
+            // Update HMAC with decompressed plaintext data
+            decryptor.update_hmac(&data);
+
+            // Verify authentication code
+            if let Some(ac) = auth_code {
+                decryptor.verify_auth_code(&ac)?;
+            }
+        }
 
         Ok(data)
     }
@@ -298,8 +410,12 @@ impl StreamingZipReader {
                 break;
             }
 
-            // Skip version made by, version needed, flags
-            file.seek(SeekFrom::Current(6))?;
+            // Skip version made by, version needed
+            file.seek(SeekFrom::Current(4))?;
+
+            // Read flags (needed for encryption check)
+            #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
+            let flags = Self::read_u16_le_static(file)?;
 
             let compression_method = Self::read_u16_le_static(file)?;
 
@@ -409,6 +525,8 @@ impl StreamingZipReader {
                 uncompressed_size,
                 compression_method,
                 offset,
+                #[cfg(feature = "encryption")]
+                is_encrypted: (flags & 0x01) != 0,
             });
         }
 
@@ -553,5 +671,82 @@ impl StreamingZipReader {
         let mut buf = [0u8; 4];
         file.read_exact(&mut buf)?;
         Ok(u32::from_le_bytes(buf))
+    }
+
+    /// Parse AES encryption info from extra field
+    #[cfg(feature = "encryption")]
+    fn parse_aes_extra_field(
+        &mut self,
+        extra_len: usize,
+    ) -> Result<Option<(AesStrength, Vec<u8>, [u8; 2])>> {
+        if extra_len == 0 {
+            return Ok(None);
+        }
+
+        let mut extra_buf = vec![0u8; extra_len];
+        self.file.read_exact(&mut extra_buf)?;
+
+        // Parse extra fields looking for AES extra (0x9901)
+        let mut i = 0usize;
+        while i + 4 <= extra_buf.len() {
+            let id = u16::from_le_bytes([extra_buf[i], extra_buf[i + 1]]);
+            let data_len = u16::from_le_bytes([extra_buf[i + 2], extra_buf[i + 3]]) as usize;
+            i += 4;
+
+            if i + data_len > extra_buf.len() {
+                break;
+            }
+
+            if id == 0x9901 {
+                // WinZip AES encryption extra field
+                // Layout: version(2) + vendor(2) + strength(2) + compression(2) + salt + pwverify(2)
+
+                if data_len < 7 {
+                    return Err(SZipError::InvalidFormat(
+                        "Invalid AES extra field".to_string(),
+                    ));
+                }
+
+                let strength_code = u16::from_le_bytes([extra_buf[i + 4], extra_buf[i + 5]]);
+
+                let strength = match strength_code {
+                    0x03 => AesStrength::Aes256,
+                    _ => {
+                        return Err(SZipError::InvalidFormat(format!(
+                            "Unsupported AES strength: {}",
+                            strength_code
+                        )))
+                    }
+                };
+
+                // Read salt and password verification from actual file data (not extra field)
+                // Salt comes after the extra field, before compressed data
+                let salt_size = strength.salt_size();
+
+                let pos_before = self.file.stream_position()?;
+                eprintln!(
+                    "DEBUG: File position before reading salt: 0x{:x}",
+                    pos_before
+                );
+
+                let mut salt = vec![0u8; salt_size];
+                self.file.read_exact(&mut salt)?;
+
+                let mut pw_verify = [0u8; 2];
+                self.file.read_exact(&mut pw_verify)?;
+
+                eprintln!("DEBUG: Read salt ({} bytes): {:02x?}", salt.len(), salt);
+                eprintln!(
+                    "DEBUG: Read pw_verify: {:02x}{:02x}",
+                    pw_verify[0], pw_verify[1]
+                );
+
+                return Ok(Some((strength, salt, pw_verify)));
+            }
+
+            i += data_len;
+        }
+
+        Ok(None)
     }
 }

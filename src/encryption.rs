@@ -121,11 +121,13 @@ impl AesEncryptor {
         self.strength
     }
 
-    /// Encrypt data in-place using AES-256-CTR
-    pub fn encrypt(&mut self, data: &mut [u8]) -> Result<()> {
-        // Update HMAC with plaintext
+    /// Update HMAC with plaintext data (call BEFORE encryption)
+    pub fn update_hmac(&mut self, data: &[u8]) {
         self.hmac.update(data);
+    }
 
+    /// Encrypt data in-place using AES-256-CTR (call AFTER compression)
+    pub fn encrypt(&mut self, data: &mut [u8]) -> Result<()> {
         // Create AES-CTR cipher
         let key = self.encryption_key.as_slice();
         let iv = vec![0u8; 16]; // Counter mode IV (starts at 0)
@@ -148,16 +150,24 @@ impl AesEncryptor {
 
 /// AES decryption context for a ZIP entry
 pub struct AesDecryptor {
+    #[allow(dead_code)] // Kept for future API extensions
     strength: AesStrength,
     encryption_key: Vec<u8>,
     #[allow(dead_code)] // Used by HMAC, kept for future direct access
     auth_key: Vec<u8>,
+    #[allow(dead_code)] // Used for password validation, kept for debugging
+    password_verify: [u8; 2],
     hmac: HmacSha1,
 }
 
 impl AesDecryptor {
-    /// Create a new AES decryptor with the given password and salt
-    pub fn new(password: &str, strength: AesStrength, salt: &[u8]) -> Result<Self> {
+    /// Create a new AES decryptor with the given password, salt, and password verification bytes
+    pub fn new(
+        password: &str,
+        strength: AesStrength,
+        salt: &[u8],
+        password_verify: &[u8; 2],
+    ) -> Result<Self> {
         // Validate salt size
         if salt.len() != strength.salt_size() {
             return Err(SZipError::InvalidFormat(format!(
@@ -177,6 +187,12 @@ impl AesDecryptor {
         let key_size = strength.key_size();
         let encryption_key = derived_keys[..key_size].to_vec();
         let auth_key = derived_keys[key_size..key_size * 2].to_vec();
+        let expected_pw_verify = [derived_keys[key_size * 2], derived_keys[key_size * 2 + 1]];
+
+        // Verify password immediately
+        if &expected_pw_verify != password_verify {
+            return Err(SZipError::InvalidFormat("Incorrect password".to_string()));
+        }
 
         // Initialize HMAC for authentication
         let hmac = HmacSha1::new_from_slice(&auth_key)
@@ -186,23 +202,12 @@ impl AesDecryptor {
             strength,
             encryption_key,
             auth_key,
+            password_verify: *password_verify,
             hmac,
         })
     }
 
-    /// Verify password using password verification bytes
-    pub fn verify_password(&self, password_verify: &[u8; 2], derived_keys: &[u8]) -> Result<()> {
-        let key_size = self.strength.key_size();
-        let expected = [derived_keys[key_size * 2], derived_keys[key_size * 2 + 1]];
-
-        if &expected != password_verify {
-            return Err(SZipError::InvalidFormat("Incorrect password".to_string()));
-        }
-
-        Ok(())
-    }
-
-    /// Decrypt data in-place using AES-256-CTR
+    /// Decrypt data in-place using AES-256-CTR (call on compressed encrypted data)
     pub fn decrypt(&mut self, data: &mut [u8]) -> Result<()> {
         // Create AES-CTR cipher
         let key = self.encryption_key.as_slice();
@@ -213,10 +218,12 @@ impl AesDecryptor {
         // Decrypt in-place
         cipher.apply_keystream(data);
 
-        // Update HMAC with decrypted plaintext
-        self.hmac.update(data);
-
         Ok(())
+    }
+
+    /// Update HMAC with plaintext data (call AFTER decompression)
+    pub fn update_hmac(&mut self, data: &[u8]) {
+        self.hmac.update(data);
     }
 
     /// Verify authentication code
@@ -236,23 +243,40 @@ impl AesDecryptor {
 
 /// Generate cryptographically secure random salt
 fn generate_salt(size: usize) -> Vec<u8> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Note: This is a simple implementation for demonstration
-    // In production, use a proper CSPRNG like `getrandom` or `rand::thread_rng()`
-    let mut salt = vec![0u8; size];
-
-    // Simple pseudo-random generation (REPLACE WITH PROPER CSPRNG IN PRODUCTION!)
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-
-    for (i, byte) in salt.iter_mut().enumerate() {
-        *byte = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(i as u64)) % 256) as u8;
+    // Use OS CSPRNG via `getrandom` crate when available. This is the
+    // recommended secure source of randomness for salts in cryptographic
+    // operations.
+    #[cfg(feature = "encryption")]
+    {
+        let mut salt = vec![0u8; size];
+        // getrandom should not fail on a normal OS; map failure to panic in
+        // this unlikely event. Library constructors return `Result`, so any
+        // error during initialization will be propagated from callers.
+        getrandom::getrandom(&mut salt).expect("getrandom failed to generate salt");
+        salt
     }
 
-    salt
+    // Fallback for builds without `getrandom` feature (shouldn't occur
+    // because the `encryption` feature enables `getrandom` in Cargo.toml).
+    #[cfg(not(feature = "encryption"))]
+    {
+        // As a safe fallback, use the platform RNG from the standard library's
+        // randomness support via `rand` is preferred, but to avoid adding an
+        // extra dependency here, fall back to a simple time-based seed. This
+        // branch is only used when encryption feature is disabled.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let mut salt = vec![0u8; size];
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+
+        for (i, byte) in salt.iter_mut().enumerate() {
+            *byte = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(i as u64)) % 256) as u8;
+        }
+
+        salt
+    }
 }
 
 #[cfg(test)]
@@ -274,7 +298,7 @@ mod tests {
         // Encrypt
         let mut encryptor = AesEncryptor::new(password, AesStrength::Aes256).unwrap();
         let salt = encryptor.salt().to_vec();
-        let _password_verify = *encryptor.password_verify();
+        let password_verify = *encryptor.password_verify();
 
         let mut encrypted = plaintext.to_vec();
         encryptor.encrypt(&mut encrypted).unwrap();
@@ -284,7 +308,8 @@ mod tests {
         assert_ne!(encrypted, plaintext);
 
         // Decrypt
-        let mut decryptor = AesDecryptor::new(password, AesStrength::Aes256, &salt).unwrap();
+        let mut decryptor =
+            AesDecryptor::new(password, AesStrength::Aes256, &salt, &password_verify).unwrap();
         decryptor.decrypt(&mut encrypted).unwrap();
         decryptor.verify_auth_code(&auth_code).unwrap();
 
@@ -301,15 +326,14 @@ mod tests {
         // Encrypt with correct password
         let mut encryptor = AesEncryptor::new(password, AesStrength::Aes256).unwrap();
         let salt = encryptor.salt().to_vec();
+        let password_verify = *encryptor.password_verify();
 
         let mut encrypted = plaintext.to_vec();
         encryptor.encrypt(&mut encrypted).unwrap();
 
-        // Try to decrypt with wrong password
-        let mut decryptor = AesDecryptor::new(wrong_password, AesStrength::Aes256, &salt).unwrap();
-        decryptor.decrypt(&mut encrypted).unwrap();
-
-        // Decrypted data should NOT match original (wrong key used)
-        assert_ne!(encrypted, plaintext);
+        // Try to decrypt with wrong password - should fail at password verification
+        let result =
+            AesDecryptor::new(wrong_password, AesStrength::Aes256, &salt, &password_verify);
+        assert!(result.is_err(), "Expected password verification to fail");
     }
 }
