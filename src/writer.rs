@@ -448,13 +448,15 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         #[cfg(feature = "encryption")]
         if let Some(ref enc) = encryptor {
             // AES extra field header (0x9901)
+            // Format per WinZip AE-2 spec:
+            //   ID(2) + Length(2) + Version(2) + Vendor(2) + Strength(1) + ActualCompression(2) = 7 bytes data
             self.output.write_all(&[0x01, 0x99])?; // WinZip AES encryption marker
-            self.output.write_all(&[7, 0])?; // data size
-            self.output.write_all(&[2, 0])?; // AE-2 format
+            self.output.write_all(&[7, 0])?; // data size (7 bytes)
+            self.output.write_all(&[2, 0])?; // AE-2 format version
             self.output.write_all(&[0x41, 0x45])?; // vendor ID "AE"
             self.output
-                .write_all(&enc.strength().to_winzip_code().to_le_bytes())?; // strength
-            self.output.write_all(&compression_method.to_le_bytes())?; // actual compression
+                .write_all(&[enc.strength().to_winzip_code() as u8])?; // strength (1 byte!)
+            self.output.write_all(&compression_method.to_le_bytes())?; // actual compression (2 bytes)
 
             // Write salt and password verification
             self.output.write_all(enc.salt())?;

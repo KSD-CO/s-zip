@@ -366,9 +366,26 @@ Encryption adds overhead but maintains constant memory usage:
 
 ### Decryption Support
 
-Currently, **decryption is not yet implemented** in the reader. This is planned for future releases. For now, you can extract encrypted ZIPs using:
+**Full encryption and decryption support** is available! You can create password-protected ZIPs and read them back with the same library:
+
+```rust
+// Write encrypted ZIP
+let mut writer = StreamingZipWriter::new("secure.zip")?;
+writer.set_password("my_password");
+writer.start_entry("secret.txt")?;
+writer.write_data(b"Confidential data")?;
+writer.finish()?;
+
+// Read encrypted ZIP
+let mut reader = StreamingZipReader::open("secure.zip")?;
+reader.set_password("my_password");
+let data = reader.read_entry_by_name("secret.txt")?;
+// data contains "Confidential data"
+```
+
+Encrypted ZIPs created by s-zip are also compatible with:
 - 7-Zip: `7z x encrypted.zip`
-- WinZip, WinRAR, or other tools that support WinZip AE-2 format
+- WinZip, WinRAR, and other tools that support WinZip AE-2 format
 
 ## Async/Await Support
 

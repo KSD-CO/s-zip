@@ -86,11 +86,24 @@ impl AesEncryptor {
 
         pbkdf2_hmac::<Sha1>(password.as_bytes(), &salt, 1000, &mut derived_keys);
 
+        eprintln!("DEBUG AesEncryptor::new:");
+        eprintln!("  password: {}", password);
+        eprintln!("  salt: {:02x?}", salt);
+        eprintln!(
+            "  derived_keys (first 66 bytes): {:02x?}",
+            &derived_keys[..66.min(derived_keys.len())]
+        );
+
         // Split derived key material
         let key_size = strength.key_size();
         let encryption_key = derived_keys[..key_size].to_vec();
         let auth_key = derived_keys[key_size..key_size * 2].to_vec();
         let password_verify = [derived_keys[key_size * 2], derived_keys[key_size * 2 + 1]];
+
+        eprintln!(
+            "  password_verify: {:02x}{:02x}",
+            password_verify[0], password_verify[1]
+        );
 
         // Initialize HMAC for authentication
         let hmac = HmacSha1::new_from_slice(&auth_key)

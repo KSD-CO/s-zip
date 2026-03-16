@@ -155,11 +155,6 @@ impl StreamingZipReader {
         // Check for AES encryption in extra field
         #[cfg(feature = "encryption")]
         let encryption_info = if is_encrypted {
-            eprintln!(
-                "DEBUG: File position before parse_aes_extra_field: 0x{:x}",
-                self.file.stream_position()?
-            );
-            eprintln!("DEBUG: extra_len = {}", extra_len);
             self.parse_aes_extra_field(extra_len)?
         } else {
             // Skip extra field if not encrypted
@@ -708,7 +703,7 @@ impl StreamingZipReader {
                     ));
                 }
 
-                let strength_code = u16::from_le_bytes([extra_buf[i + 4], extra_buf[i + 5]]);
+                let strength_code = extra_buf[i + 4]; // AES strength is 1 byte, not 2!
 
                 let strength = match strength_code {
                     0x03 => AesStrength::Aes256,
@@ -724,23 +719,11 @@ impl StreamingZipReader {
                 // Salt comes after the extra field, before compressed data
                 let salt_size = strength.salt_size();
 
-                let pos_before = self.file.stream_position()?;
-                eprintln!(
-                    "DEBUG: File position before reading salt: 0x{:x}",
-                    pos_before
-                );
-
                 let mut salt = vec![0u8; salt_size];
                 self.file.read_exact(&mut salt)?;
 
                 let mut pw_verify = [0u8; 2];
                 self.file.read_exact(&mut pw_verify)?;
-
-                eprintln!("DEBUG: Read salt ({} bytes): {:02x?}", salt.len(), salt);
-                eprintln!(
-                    "DEBUG: Read pw_verify: {:02x}{:02x}",
-                    pw_verify[0], pw_verify[1]
-                );
 
                 return Ok(Some((strength, salt, pw_verify)));
             }
