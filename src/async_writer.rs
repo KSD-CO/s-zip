@@ -22,6 +22,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
+#[cfg(feature = "encryption")]
+use crate::encryption::{AesEncryptor, AesStrength};
+
 /// Entry being written to ZIP
 struct ZipEntry {
     name: String,
@@ -30,6 +33,8 @@ struct ZipEntry {
     compressed_size: u64,
     uncompressed_size: u64,
     compression_method: u16,
+    #[cfg(feature = "encryption")]
+    encryption_strength: Option<u16>,
 }
 
 /// Async streaming ZIP writer that compresses data on-the-fly
@@ -39,6 +44,10 @@ pub struct AsyncStreamingZipWriter<W: AsyncWrite + AsyncSeek + Unpin> {
     current_entry: Option<CurrentEntry>,
     compression_level: u32,
     compression_method: CompressionMethod,
+    #[cfg(feature = "encryption")]
+    password: Option<String>,
+    #[cfg(feature = "encryption")]
+    encryption_strength: AesStrength,
 }
 
 struct CurrentEntry {
@@ -47,6 +56,8 @@ struct CurrentEntry {
     encoder: Box<dyn AsyncCompressorWrite>,
     counter: CrcCounter,
     compression_method: u16,
+    #[cfg(feature = "encryption")]
+    encryptor: Option<AesEncryptor>,
 }
 
 /// Trait for async compression encoders
@@ -270,6 +281,10 @@ impl AsyncStreamingZipWriter<tokio::fs::File> {
             current_entry: None,
             compression_level,
             compression_method: method,
+            #[cfg(feature = "encryption")]
+            password: None,
+            #[cfg(feature = "encryption")]
+            encryption_strength: AesStrength::Aes256,
         })
     }
 
@@ -283,6 +298,10 @@ impl AsyncStreamingZipWriter<tokio::fs::File> {
             current_entry: None,
             compression_level: compression_level as u32,
             compression_method: CompressionMethod::Zstd,
+            #[cfg(feature = "encryption")]
+            password: None,
+            #[cfg(feature = "encryption")]
+            encryption_strength: AesStrength::Aes256,
         })
     }
 }
@@ -315,7 +334,49 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             current_entry: None,
             compression_level,
             compression_method: method,
+            #[cfg(feature = "encryption")]
+            password: None,
+            #[cfg(feature = "encryption")]
+            encryption_strength: AesStrength::Aes256,
         }
+    }
+
+    /// Set password for AES-256 encryption of subsequent entries (requires encryption feature)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::{AsyncStreamingZipWriter, Result};
+    /// # async fn example() -> Result<()> {
+    /// let mut writer = AsyncStreamingZipWriter::new("encrypted.zip").await?;
+    /// writer.set_password("my_secure_password");
+    ///
+    /// writer.start_entry("secret.txt").await?;
+    /// writer.write_data(b"Confidential data").await?;
+    /// writer.finish().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "encryption")]
+    pub fn set_password(&mut self, password: impl Into<String>) -> &mut Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Set AES encryption strength (default: AES-256)
+    ///
+    /// # Arguments
+    /// * `strength` - AES encryption strength (Aes256 is the only supported variant currently)
+    #[cfg(feature = "encryption")]
+    pub fn set_encryption_strength(&mut self, strength: AesStrength) -> &mut Self {
+        self.encryption_strength = strength;
+        self
+    }
+
+    /// Clear password (disable encryption for subsequent entries)
+    #[cfg(feature = "encryption")]
+    pub fn clear_password(&mut self) -> &mut Self {
+        self.password = None;
+        self
     }
 
     /// Start a new entry (file) in the ZIP
@@ -354,10 +415,22 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         let local_header_offset = self.output.stream_position().await?;
         let compression_method = self.compression_method.to_zip_method();
 
-        // Write local file header with data descriptor flag (bit 3)
+        // Check if encryption is enabled
+        #[cfg(feature = "encryption")]
+        let (encryptor, encryption_flag) = if let Some(ref password) = self.password {
+            let enc = AesEncryptor::new(password, self.encryption_strength)?;
+            (Some(enc), 0x01) // bit 0 set for encryption
+        } else {
+            (None, 0x00)
+        };
+
+        #[cfg(not(feature = "encryption"))]
+        let encryption_flag = 0x00;
+
+        // Write local file header with data descriptor flag (bit 3) + encryption flag (bit 0)
         self.output.write_all(&[0x50, 0x4b, 0x03, 0x04]).await?; // signature
-        self.output.write_all(&[20, 0]).await?; // version needed
-        self.output.write_all(&[8, 0]).await?; // general purpose bit flag (bit 3 set)
+        self.output.write_all(&[51, 0]).await?; // version needed (5.1 for AES)
+        self.output.write_all(&[8 | encryption_flag, 0]).await?; // general purpose bit flag
         self.output
             .write_all(&compression_method.to_le_bytes())
             .await?; // compression method
@@ -368,8 +441,34 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         self.output
             .write_all(&(name.len() as u16).to_le_bytes())
             .await?;
-        self.output.write_all(&0u16.to_le_bytes()).await?; // extra len
+
+        // Calculate extra field size for AES
+        #[cfg(feature = "encryption")]
+        let extra_len = if encryptor.is_some() { 11 } else { 0 };
+        #[cfg(not(feature = "encryption"))]
+        let extra_len = 0;
+
+        self.output.write_all(&(extra_len as u16).to_le_bytes()).await?; // extra len
         self.output.write_all(name.as_bytes()).await?;
+
+        // Write AES extra field if encryption is enabled
+        #[cfg(feature = "encryption")]
+        if let Some(ref enc) = encryptor {
+            // AES extra field header (0x9901)
+            // Format per WinZip AE-2 spec:
+            //   ID(2) + Length(2) + Version(2) + Vendor(2) + Strength(1) + ActualCompression(2) = 7 bytes data
+            self.output.write_all(&[0x01, 0x99]).await?; // WinZip AES encryption marker
+            self.output.write_all(&[7, 0]).await?; // data size (7 bytes)
+            self.output.write_all(&[2, 0]).await?; // AE-2 format version
+            self.output.write_all(&[0x41, 0x45]).await?; // vendor ID "AE"
+            self.output
+                .write_all(&[enc.strength().to_winzip_code() as u8]).await?; // strength (1 byte!)
+            self.output.write_all(&compression_method.to_le_bytes()).await?; // actual compression (2 bytes)
+
+            // Write salt and password verification
+            self.output.write_all(enc.salt()).await?;
+            self.output.write_all(enc.password_verify()).await?;
+        }
 
         // Create encoder for this entry based on compression method
         // Use adaptive buffer if size hint is provided
@@ -412,18 +511,30 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             }
         };
 
+        #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
+        let mut counter = CrcCounter::new();
+
+        // Account for salt and password verify bytes in compressed size for encrypted entries
+        #[cfg(feature = "encryption")]
+        if let Some(ref enc) = encryptor {
+            let encryption_overhead = (enc.salt().len() + 2) as u64; // salt + password_verify
+            counter.add_compressed(encryption_overhead);
+        }
+
         self.current_entry = Some(CurrentEntry {
             name: name.to_string(),
             local_header_offset,
             encoder,
-            counter: CrcCounter::new(),
+            counter,
             compression_method,
+            #[cfg(feature = "encryption")]
+            encryptor,
         });
 
         Ok(())
     }
 
-    /// Write uncompressed data to current entry (will be compressed on-the-fly)
+    /// Write uncompressed data to current entry (will be compressed and/or encrypted on-the-fly)
     pub async fn write_data(&mut self, data: &[u8]) -> Result<()> {
         let entry = self
             .current_entry
@@ -432,6 +543,12 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
 
         // Update CRC and size with uncompressed data
         entry.counter.update_uncompressed(data);
+
+        // For AES encryption: Update HMAC with plaintext BEFORE compression
+        #[cfg(feature = "encryption")]
+        if let Some(ref mut encryptor) = entry.encryptor {
+            encryptor.update_hmac(data);
+        }
 
         // Write to encoder (compresses data into buffer)
         entry.encoder.write_all(data).await?;
@@ -444,8 +561,22 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         if buffer.should_flush() {
             // Flush buffer to output to keep memory usage low
             let compressed_data = buffer.take();
-            self.output.write_all(&compressed_data).await?;
-            entry.counter.add_compressed(compressed_data.len() as u64);
+
+            // Encrypt compressed data if encryption is enabled and password is set
+            #[cfg(feature = "encryption")]
+            let data_to_write = if let Some(ref mut encryptor) = entry.encryptor {
+                let mut data_to_encrypt = compressed_data;
+                encryptor.encrypt(&mut data_to_encrypt)?;
+                data_to_encrypt
+            } else {
+                compressed_data
+            };
+
+            #[cfg(not(feature = "encryption"))]
+            let data_to_write = compressed_data;
+
+            self.output.write_all(&data_to_write).await?;
+            entry.counter.add_compressed(data_to_write.len() as u64);
         }
 
         Ok(())
@@ -460,12 +591,40 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             // Flush any remaining data from buffer to output
             let remaining_data = buffer.take();
             if !remaining_data.is_empty() {
-                self.output.write_all(&remaining_data).await?;
-                entry.counter.add_compressed(remaining_data.len() as u64);
+                // Encrypt remaining compressed data if encryption is enabled and password is set
+                #[cfg(feature = "encryption")]
+                let data_to_write = if let Some(ref mut encryptor) = entry.encryptor {
+                    let mut data_to_encrypt = remaining_data;
+                    encryptor.encrypt(&mut data_to_encrypt)?;
+                    data_to_encrypt
+                } else {
+                    remaining_data
+                };
+
+                #[cfg(not(feature = "encryption"))]
+                let data_to_write = remaining_data;
+
+                self.output.write_all(&data_to_write).await?;
+                entry.counter.add_compressed(data_to_write.len() as u64);
             }
 
+            // Write authentication code for AES encryption
+            #[cfg(feature = "encryption")]
+            let (encryption_strength_code, auth_code_size) =
+                if let Some(encryptor) = entry.encryptor {
+                    let strength_code = encryptor.strength().to_winzip_code();
+                    let auth_code = encryptor.finalize();
+                    self.output.write_all(&auth_code).await?;
+                    (Some(strength_code), auth_code.len() as u64)
+                } else {
+                    (None, 0)
+                };
+
+            #[cfg(not(feature = "encryption"))]
+            let auth_code_size = 0u64;
+
             let crc = entry.counter.finalize();
-            let compressed_size = entry.counter.compressed_count;
+            let compressed_size = entry.counter.compressed_count + auth_code_size;
             let uncompressed_size = entry.counter.uncompressed_count;
 
             // Write data descriptor
@@ -496,6 +655,8 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 compressed_size,
                 uncompressed_size,
                 compression_method: entry.compression_method,
+                #[cfg(feature = "encryption")]
+                encryption_strength: encryption_strength_code,
             });
         }
         Ok(())
@@ -586,6 +747,8 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 compressed_size: entry.data.len() as u64,
                 uncompressed_size: entry.uncompressed_size,
                 compression_method: 8, // DEFLATE
+                #[cfg(feature = "encryption")]
+                encryption_strength: None, // Parallel compression doesn't support encryption yet
             });
         }
 
@@ -603,8 +766,19 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         for entry in &self.entries {
             self.output.write_all(&[0x50, 0x4b, 0x01, 0x02]).await?; // central dir sig
             self.output.write_all(&[20, 0]).await?; // version made by
-            self.output.write_all(&[20, 0]).await?; // version needed
-            self.output.write_all(&[8, 0]).await?; // general purpose bit flag (bit 3 set)
+            self.output.write_all(&[51, 0]).await?; // version needed (5.1 for AES)
+            
+            // general purpose bit flag: bit 3 for data descriptor + bit 0 for encryption
+            #[cfg(feature = "encryption")]
+            let flags = if entry.encryption_strength.is_some() {
+                0x09 // bit 3 + bit 0 set
+            } else {
+                0x08 // only bit 3 set
+            };
+            #[cfg(not(feature = "encryption"))]
+            let flags = 0x08;
+
+            self.output.write_all(&[flags, 0]).await?; // general purpose bit flag
             self.output
                 .write_all(&entry.compression_method.to_le_bytes())
                 .await?; // compression method
@@ -632,8 +806,23 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 .write_all(&(entry.name.len() as u16).to_le_bytes())
                 .await?;
 
-            // Prepare ZIP64 extra field if needed
+            // Prepare extra fields
             let mut extra_field: Vec<u8> = Vec::new();
+
+            // Add AES extra field if entry was encrypted
+            #[cfg(feature = "encryption")]
+            if let Some(strength_code) = entry.encryption_strength {
+                // AES extra field header (0x9901)
+                extra_field.extend_from_slice(&[0x01, 0x99]); // WinZip AES encryption marker
+                extra_field.extend_from_slice(&[7, 0]); // data size
+                extra_field.extend_from_slice(&[2, 0]); // AE-2 format
+                extra_field.extend_from_slice(&[0x41, 0x45]); // vendor ID "AE"
+                extra_field.push(strength_code as u8); // strength (1 byte!)
+                extra_field.extend_from_slice(&entry.compression_method.to_le_bytes());
+                // actual compression
+            }
+
+            // Add ZIP64 extra field if needed
             if entry.uncompressed_size > u32::MAX as u64
                 || entry.compressed_size > u32::MAX as u64
                 || entry.local_header_offset > u32::MAX as u64
