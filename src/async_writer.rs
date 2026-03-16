@@ -448,7 +448,9 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         #[cfg(not(feature = "encryption"))]
         let extra_len = 0;
 
-        self.output.write_all(&(extra_len as u16).to_le_bytes()).await?; // extra len
+        self.output
+            .write_all(&(extra_len as u16).to_le_bytes())
+            .await?; // extra len
         self.output.write_all(name.as_bytes()).await?;
 
         // Write AES extra field if encryption is enabled
@@ -462,8 +464,11 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             self.output.write_all(&[2, 0]).await?; // AE-2 format version
             self.output.write_all(&[0x41, 0x45]).await?; // vendor ID "AE"
             self.output
-                .write_all(&[enc.strength().to_winzip_code() as u8]).await?; // strength (1 byte!)
-            self.output.write_all(&compression_method.to_le_bytes()).await?; // actual compression (2 bytes)
+                .write_all(&[enc.strength().to_winzip_code() as u8])
+                .await?; // strength (1 byte!)
+            self.output
+                .write_all(&compression_method.to_le_bytes())
+                .await?; // actual compression (2 bytes)
 
             // Write salt and password verification
             self.output.write_all(enc.salt()).await?;
@@ -767,7 +772,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             self.output.write_all(&[0x50, 0x4b, 0x01, 0x02]).await?; // central dir sig
             self.output.write_all(&[20, 0]).await?; // version made by
             self.output.write_all(&[51, 0]).await?; // version needed (5.1 for AES)
-            
+
             // general purpose bit flag: bit 3 for data descriptor + bit 0 for encryption
             #[cfg(feature = "encryption")]
             let flags = if entry.encryption_strength.is_some() {

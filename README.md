@@ -4,6 +4,15 @@
 [![Documentation](https://docs.rs/s-zip/badge.svg)](https://docs.rs/s-zip)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+```text
+███████╗      ███████╗██╗██████╗ 
+██╔════╝      ╚══███╔╝██║██╔══██╗
+███████╗█████╗  ███╔╝ ██║██████╔╝
+╚════██║╚════╝ ███╔╝  ██║██╔═══╝ 
+███████║      ███████╗██║██║     
+╚══════╝      ╚══════╝╚═╝╚═╝     
+```
+
 High-performance streaming ZIP library for Rust backends. Process multi-gigabyte archives with constant ~5MB memory usage.
 
 ## Features
