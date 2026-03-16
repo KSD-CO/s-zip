@@ -387,6 +387,30 @@ Encrypted ZIPs created by s-zip are also compatible with:
 - 7-Zip: `7z x encrypted.zip`
 - WinZip, WinRAR, and other tools that support WinZip AE-2 format
 
+### Async Encryption with Tokio
+
+**NEW!** Async encryption is now fully supported, solving [Issue #1](https://github.com/KSD-CO/s-zip/issues/1):
+
+```rust
+use s_zip::AsyncStreamingZipWriter;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = AsyncStreamingZipWriter::new("encrypted.zip").await?;
+    
+    // Set password for encryption
+    writer.set_password("my_secure_password");
+    
+    writer.start_entry("secret.txt").await?;
+    writer.write_data(b"Confidential data").await?;
+    
+    writer.finish().await?;
+    Ok(())
+}
+```
+
+You can now create **password-protected ZIPs with Zstd compression** using async/await! 🎉
+
 ## Async/Await Support
 
 `s-zip` supports async/await with Tokio runtime, enabling non-blocking I/O for web servers and cloud applications.
