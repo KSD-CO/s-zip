@@ -8,7 +8,7 @@
 //!
 //! Expected RAM savings: 5-8 MB per file
 //!
-//! Supports arbitrary async writers (File, Vec<u8>, network streams, etc.)
+//! Supports arbitrary async writers (File, `Vec<u8>`, network streams, etc.)
 
 use crate::error::{Result, SZipError};
 use crate::writer::CompressionMethod;
@@ -306,6 +306,42 @@ impl AsyncStreamingZipWriter<tokio::fs::File> {
     }
 }
 
+/// Pass-through async compressor for CompressionMethod::Stored (no compression).
+/// Writes data directly to the CompressedBuffer without any encoding.
+struct StoredCompressor {
+    buffer: CompressedBuffer,
+}
+
+impl AsyncWrite for StoredCompressor {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.buffer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.buffer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.buffer).poll_shutdown(cx)
+    }
+}
+
+impl AsyncCompressorWrite for StoredCompressor {
+    fn finish_compression(
+        self: Box<Self>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<CompressedBuffer>> + Send>> {
+        Box::pin(async move { Ok(self.buffer) })
+    }
+
+    fn get_buffer_mut(&mut self) -> &mut CompressedBuffer {
+        &mut self.buffer
+    }
+}
+
 impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
     /// Create a new async ZIP writer from an arbitrary writer with default compression level (6) using DEFLATE
     pub fn from_writer(writer: W) -> Self {
@@ -509,11 +545,9 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                     "Zstd compression requires 'async-zstd' feature".to_string(),
                 ));
             }
-            CompressionMethod::Stored => {
-                return Err(SZipError::InvalidFormat(
-                    "Stored method not yet implemented".to_string(),
-                ));
-            }
+            CompressionMethod::Stored => Box::new(StoredCompressor {
+                buffer: CompressedBuffer::with_size_hint(size_hint),
+            }),
         };
 
         #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]

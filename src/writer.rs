@@ -7,7 +7,7 @@
 //!
 //! Expected RAM savings: 5-8 MB per file
 //!
-//! Now supports arbitrary writers (File, Vec<u8>, network streams, etc.)
+//! Now supports arbitrary writers (File, `Vec<u8>`, network streams, etc.)
 
 use crate::error::{Result, SZipError};
 use crc32fast::Hasher as Crc32;
@@ -385,6 +385,35 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         self.start_entry_with_hint(name, None)
     }
 
+    /// Start a new entry with file metadata (modification time and Unix permissions).
+    ///
+    /// This is the recommended method when writing files that should preserve their
+    /// original timestamps and permissions. Entries created with `start_entry()` have
+    /// zero timestamps and no permission bits.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::{StreamingZipWriter, EntryOptions};
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut writer = StreamingZipWriter::new("output.zip")?;
+    /// let opts = EntryOptions {
+    ///     mtime: Some(std::time::SystemTime::now()),
+    ///     unix_mode: Some(0o644),
+    /// };
+    /// writer.start_entry_with_options("readme.txt", opts)?;
+    /// writer.write_data(b"Hello")?;
+    /// writer.finish()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start_entry_with_options(
+        &mut self,
+        name: &str,
+        options: crate::EntryOptions,
+    ) -> Result<()> {
+        self.start_entry_with_options_and_hint(name, options, None)
+    }
+
     /// Start a new entry with size hint for optimized buffering
     ///
     /// Providing an accurate size hint can improve performance by 15-25% for large files.
@@ -406,6 +435,15 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
     /// # }
     /// ```
     pub fn start_entry_with_hint(&mut self, name: &str, size_hint: Option<u64>) -> Result<()> {
+        self.start_entry_with_options_and_hint(name, crate::EntryOptions::default(), size_hint)
+    }
+
+    fn start_entry_with_options_and_hint(
+        &mut self,
+        name: &str,
+        options: crate::EntryOptions,
+        size_hint: Option<u64>,
+    ) -> Result<()> {
         // Finish previous entry if any
         self.finish_current_entry()?;
 
@@ -429,17 +467,23 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         self.output.write_all(&[51, 0])?; // version needed (5.1 for AES)
         self.output.write_all(&[8 | encryption_flag, 0])?; // general purpose bit flag
         self.output.write_all(&compression_method.to_le_bytes())?; // compression method
-        self.output.write_all(&[0, 0, 0, 0])?; // mod time/date
+
+        // MS-DOS timestamp (time, date)
+        let (dos_time, dos_date) = options.msdos_datetime();
+        self.output.write_all(&dos_time.to_le_bytes())?;
+        self.output.write_all(&dos_date.to_le_bytes())?;
+
         self.output.write_all(&0u32.to_le_bytes())?; // crc32 placeholder
         self.output.write_all(&0u32.to_le_bytes())?; // compressed size placeholder
         self.output.write_all(&0u32.to_le_bytes())?; // uncompressed size placeholder
         self.output.write_all(&(name.len() as u16).to_le_bytes())?;
 
-        // Calculate extra field size for AES
+        // Extra field: AES (11 bytes) + Unix permissions (15 bytes) if set
+        let unix_extra = options.unix_extra_field();
         #[cfg(feature = "encryption")]
-        let extra_len = if encryptor.is_some() { 11 } else { 0 };
+        let extra_len = if encryptor.is_some() { 11 } else { 0 } + unix_extra.len();
         #[cfg(not(feature = "encryption"))]
-        let extra_len = 0;
+        let extra_len = unix_extra.len();
 
         self.output.write_all(&(extra_len as u16).to_le_bytes())?; // extra len
         self.output.write_all(name.as_bytes())?;

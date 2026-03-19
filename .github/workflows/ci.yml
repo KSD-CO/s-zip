@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Rust ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta]
+        include:
+          - os: ubuntu-latest
+            rust: nightly
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.rust }}-
+
+      # Default features (no optional features)
+      - name: Test (default)
+        run: cargo test
+
+      # All features
+      - name: Test (all features)
+        run: cargo test --all-features
+
+      # Each major feature in isolation
+      - name: Test (encryption only)
+        run: cargo test --features encryption
+
+      - name: Test (async only)
+        run: cargo test --features async
+
+      - name: Test (async + encryption)
+        run: cargo test --features "async,encryption"
+
+      - name: Test (proptest)
+        run: cargo test --test proptest_zip_parsing --all-features
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-lint-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default)
+        run: cargo clippy -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-features -- -D warnings
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-docs-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check docs (all features)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps

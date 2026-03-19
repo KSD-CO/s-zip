@@ -4,52 +4,21 @@
 //! implementing AsyncRead + AsyncSeek + Unpin + Send.
 
 use crate::error::{Result, SZipError};
+use crate::format::{
+    find_eocd_in_buffer, find_zip64_eocd_offset, parse_aes_extra_field_buf,
+    parse_zip64_extra_field, CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_SIGNATURE,
+    LOCAL_FILE_HEADER_SIGNATURE, MAX_ENTRY_ALLOC, ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE,
+};
 use async_compression::tokio::bufread::DeflateDecoder;
 #[cfg(feature = "async-zstd")]
 use async_compression::tokio::bufread::ZstdDecoder;
 use std::io::SeekFrom;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader};
 
-/// ZIP local file header signature
-const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x04034b50;
-
-/// ZIP central directory signature
-const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x02014b50;
-
-/// ZIP end of central directory signature
-const END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06054b50;
-
-/// ZIP64 end of central directory record signature
-const ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06064b50;
-
-/// Maximum single-entry allocation (2 GiB). Mirrors reader.rs.
-const MAX_ENTRY_ALLOC: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-
-/// Entry in the ZIP central directory
-#[derive(Debug, Clone)]
-pub struct ZipEntry {
-    pub name: String,
-    pub compressed_size: u64,
-    pub uncompressed_size: u64,
-    pub compression_method: u16,
-    pub offset: u64,
-    /// True if general-purpose bit 0 (encryption flag) is set.
-    pub is_encrypted: bool,
-}
-
-impl ZipEntry {
-    /// Return a sanitized extraction path safe against zip-slip attacks.
-    /// Strips leading `/`, `\`, `..`, and Windows drive prefixes.
-    /// See `reader::ZipEntry::safe_path()` for full documentation.
-    pub fn safe_path(&self) -> PathBuf {
-        Path::new(&self.name)
-            .components()
-            .filter(|c| matches!(c, Component::Normal(_)))
-            .collect()
-    }
-}
+// Re-export ZipEntry so existing `use s_zip::async_reader::ZipEntry` paths still compile.
+pub use crate::format::ZipEntry;
 
 /// Generic async streaming ZIP reader that works with any async reader + seeker
 ///
@@ -57,6 +26,8 @@ impl ZipEntry {
 pub struct GenericAsyncZipReader<R: AsyncRead + AsyncSeek + Unpin + Send> {
     reader: BufReader<R>,
     entries: Vec<ZipEntry>,
+    #[cfg(feature = "encryption")]
+    password: Option<String>,
 }
 
 /// Type alias for file-based async ZIP reader (convenience)
@@ -113,7 +84,12 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         // Find and read central directory
         let entries = Self::read_central_directory(&mut reader).await?;
 
-        Ok(GenericAsyncZipReader { reader, entries })
+        Ok(GenericAsyncZipReader {
+            reader,
+            entries,
+            #[cfg(feature = "encryption")]
+            password: None,
+        })
     }
 
     /// Get list of all entries in the ZIP
@@ -124,6 +100,25 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
     /// Find an entry by name
     pub fn find_entry(&self, name: &str) -> Option<&ZipEntry> {
         self.entries.iter().find(|e| e.name == name)
+    }
+
+    /// Set the password for decrypting AES-256 encrypted entries.
+    ///
+    /// Call this before `read_entry()` when the ZIP contains encrypted entries.
+    /// Requires the `encryption` feature.
+    ///
+    /// ```no_run
+    /// # use s_zip::AsyncStreamingZipReader;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut reader = AsyncStreamingZipReader::open("secure.zip").await?;
+    /// reader.set_password("my_password");
+    /// let data = reader.read_entry_by_name("secret.txt").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "encryption")]
+    pub fn set_password(&mut self, password: impl Into<String>) {
+        self.password = Some(password.into());
     }
 
     /// Read an entry's decompressed data into a vector
@@ -139,38 +134,104 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
             ));
         }
 
-        // Skip version, flags, compression method
-        self.reader.seek(SeekFrom::Current(6)).await?;
+        // Skip version (2 bytes)
+        self.reader.seek(SeekFrom::Current(2)).await?;
+
+        // Read flags to check for encryption
+        let flags = self.read_u16_le().await?;
+        let is_encrypted_local = (flags & 0x01) != 0;
+
+        // Read compression method (skip — use value from central directory)
+        self.reader.seek(SeekFrom::Current(2)).await?;
 
         // Skip modification time and date, CRC-32
         self.reader.seek(SeekFrom::Current(8)).await?;
 
-        // Read compressed and uncompressed sizes (already known from central directory)
+        // Skip compressed and uncompressed sizes (use from central directory)
         self.reader.seek(SeekFrom::Current(8)).await?;
 
         // Read filename length and extra field length
         let filename_len = self.read_u16_le().await? as i64;
-        let extra_len = self.read_u16_le().await? as i64;
+        let extra_len = self.read_u16_le().await? as usize;
 
-        // Skip filename and extra field
-        self.reader
-            .seek(SeekFrom::Current(filename_len + extra_len))
-            .await?;
+        // Skip filename
+        self.reader.seek(SeekFrom::Current(filename_len)).await?;
+
+        // Parse AES extra field if encrypted
+        #[cfg(feature = "encryption")]
+        let encryption_info = if is_encrypted_local {
+            self.parse_aes_extra_field(extra_len).await?
+        } else {
+            self.reader
+                .seek(SeekFrom::Current(extra_len as i64))
+                .await?;
+            None
+        };
+
+        #[cfg(not(feature = "encryption"))]
+        {
+            if is_encrypted_local {
+                return Err(SZipError::InvalidFormat(
+                    "Encrypted entry found but encryption feature not enabled".to_string(),
+                ));
+            }
+            self.reader
+                .seek(SeekFrom::Current(extra_len as i64))
+                .await?;
+        }
 
         // Guard against OOM from corrupt/malicious compressed_size values.
-        if entry.compressed_size > MAX_ENTRY_ALLOC {
+        // For encrypted entries, the actual data size is smaller (salt + pw_verify already consumed).
+        #[cfg(feature = "encryption")]
+        let data_size = if let Some((strength, _, _)) = encryption_info {
+            entry
+                .compressed_size
+                .saturating_sub((strength.salt_size() + 2 + 10) as u64)
+        } else {
+            entry.compressed_size
+        };
+        #[cfg(not(feature = "encryption"))]
+        let data_size = entry.compressed_size;
+
+        if data_size > MAX_ENTRY_ALLOC {
             return Err(SZipError::InvalidFormat(format!(
                 "Entry '{}' is too large to read into memory ({} bytes). \
                  Use read_entry_streaming() for entries larger than 2 GiB.",
-                entry.name, entry.compressed_size
+                entry.name, data_size
             )));
         }
 
-        // Now read the compressed data
-        let mut compressed_data = vec![0u8; entry.compressed_size as usize];
+        // Read compressed (and possibly encrypted) data
+        let mut compressed_data = vec![0u8; data_size as usize];
         self.reader.read_exact(&mut compressed_data).await?;
 
-        // Decompress if needed
+        // Read auth code if encrypted (10 bytes HMAC-SHA1 truncated)
+        #[cfg(feature = "encryption")]
+        let auth_code = if encryption_info.is_some() {
+            let mut ac = vec![0u8; 10];
+            self.reader.read_exact(&mut ac).await?;
+            Some(ac)
+        } else {
+            None
+        };
+
+        // Decrypt compressed data in-place (Step 1)
+        #[cfg(feature = "encryption")]
+        let decryptor_opt = if let Some((strength, salt, pw_verify)) = encryption_info {
+            use crate::encryption::AesDecryptor;
+            let password = self.password.as_ref().ok_or_else(|| {
+                SZipError::EncryptionError(
+                    "Encrypted entry but no password set. Call set_password() first.".to_string(),
+                )
+            })?;
+            let mut decryptor = AesDecryptor::new(password, strength, &salt, &pw_verify)?;
+            decryptor.decrypt(&mut compressed_data)?;
+            Some(decryptor)
+        } else {
+            None
+        };
+
+        // Decompress if needed (Step 2)
         let data = if entry.compression_method == 8 {
             // DEFLATE compression
             let mut decoder = DeflateDecoder::new(&compressed_data[..]);
@@ -196,6 +257,28 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         } else {
             return Err(SZipError::UnsupportedCompression(entry.compression_method));
         };
+
+        // Verify HMAC authentication for encrypted entries (Step 3)
+        #[cfg(feature = "encryption")]
+        if let Some(mut decryptor) = decryptor_opt {
+            decryptor.update_hmac(&data);
+            if let Some(ac) = auth_code {
+                decryptor.verify_auth_code(&ac)?;
+            }
+        }
+
+        // Verify CRC-32 integrity — catches bit-rot and truncated downloads.
+        // Skip for encrypted entries (HMAC provides stronger authentication).
+        if entry.crc32 != 0 && !entry.is_encrypted {
+            let actual_crc = crc32fast::hash(&data);
+            if actual_crc != entry.crc32 {
+                return Err(SZipError::InvalidFormat(format!(
+                    "CRC-32 mismatch for '{}': expected {:#010x}, got {:#010x}. \
+                     The entry may be corrupt or the download may be incomplete.",
+                    entry.name, entry.crc32, actual_crc
+                )));
+            }
+        }
 
         Ok(data)
     }
@@ -224,26 +307,27 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         self.read_entry_streaming(&entry).await
     }
 
-    /// Get a streaming reader for an entry (for large files)
-    /// Returns a reader that decompresses data on-the-fly without loading everything into memory
+    /// Get a streaming reader for an entry (for large files).
+    ///
+    /// Returns an `AsyncRead` impl that decompresses (and, if encrypted, decrypts)
+    /// data on-the-fly without loading the entire entry into memory.
+    ///
+    /// # Encrypted entries
+    ///
+    /// When both `encryption` and `async` features are enabled and the entry is
+    /// encrypted, decryption happens on-the-fly.  **Callers must read all bytes
+    /// and then call `finish()` on the returned reader to verify the HMAC-SHA1
+    /// authentication tag.**  The HMAC covers the *compressed ciphertext* bytes,
+    /// not the decompressed plaintext (a known limitation of the streaming path).
+    /// For full WinZip AE-2 compliance use `read_entry()` instead.
     ///
     /// # Errors
-    /// Returns `SZipError::EncryptionError` if the entry is encrypted.
-    /// Use `read_entry()` for encrypted entries.
+    /// Returns `SZipError::EncryptionError` if the entry is encrypted but
+    /// `set_password()` was not called or the password is wrong.
     pub async fn read_entry_streaming(
         &mut self,
         entry: &ZipEntry,
     ) -> Result<Box<dyn AsyncRead + Unpin + Send + '_>> {
-        // Encrypted entries cannot be streamed safely without HMAC verification.
-        #[cfg(feature = "encryption")]
-        if entry.is_encrypted {
-            return Err(SZipError::EncryptionError(
-                "Streaming read is not supported for encrypted entries. \
-                 Use read_entry() instead, which decrypts and authenticates the full entry."
-                    .to_string(),
-            ));
-        }
-
         // Seek to local file header
         self.reader.seek(SeekFrom::Start(entry.offset)).await?;
 
@@ -261,16 +345,80 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         // Skip modification time and date, CRC-32
         self.reader.seek(SeekFrom::Current(8)).await?;
 
-        // Read compressed and uncompressed sizes
+        // Read compressed and uncompressed sizes (use from central directory)
         self.reader.seek(SeekFrom::Current(8)).await?;
 
         // Read filename length and extra field length
         let filename_len = self.read_u16_le().await? as i64;
-        let extra_len = self.read_u16_le().await? as i64;
+        let extra_len = self.read_u16_le().await? as usize;
 
-        // Skip filename and extra field
+        // Skip filename
+        self.reader.seek(SeekFrom::Current(filename_len)).await?;
+
+        // For encrypted entries: decrypt on-the-fly.
+        #[cfg(feature = "encryption")]
+        if entry.is_encrypted {
+            let encryption_info = self.parse_aes_extra_field(extra_len).await?;
+
+            if let Some((strength, salt, pw_verify)) = encryption_info {
+                let password = self.password.as_ref().ok_or_else(|| {
+                    SZipError::EncryptionError(
+                        "Encrypted entry but no password set. Call set_password() first."
+                            .to_string(),
+                    )
+                })?;
+
+                let overhead = (strength.salt_size() + 2 + 10) as u64;
+                let cipher_size = entry.compressed_size.saturating_sub(overhead);
+
+                // Read auth code (seek past ciphertext, read 10 bytes, seek back)
+                let current_pos = self.reader.stream_position().await?;
+                self.reader
+                    .seek(SeekFrom::Start(current_pos + cipher_size))
+                    .await?;
+                let mut auth_code = vec![0u8; 10];
+                self.reader.read_exact(&mut auth_code).await?;
+                self.reader.seek(SeekFrom::Start(current_pos)).await?;
+
+                let limited_reader = (&mut self.reader).take(cipher_size);
+
+                use crate::decrypt_reader::r#async::AsyncDecryptingReader;
+                let decrypt_reader = AsyncDecryptingReader::new(
+                    limited_reader,
+                    password,
+                    strength,
+                    &salt,
+                    &pw_verify,
+                    auth_code,
+                )?;
+
+                return if entry.compression_method == 8 {
+                    Ok(Box::new(DeflateDecoder::new(BufReader::new(
+                        decrypt_reader,
+                    ))))
+                } else if entry.compression_method == 0 {
+                    Ok(Box::new(decrypt_reader))
+                } else {
+                    Err(SZipError::UnsupportedCompression(entry.compression_method))
+                };
+            } else {
+                self.reader
+                    .seek(SeekFrom::Current(extra_len as i64))
+                    .await?;
+            }
+        }
+
+        // Non-encrypted path: skip extra field
+        #[cfg(feature = "encryption")]
+        if !entry.is_encrypted {
+            self.reader
+                .seek(SeekFrom::Current(extra_len as i64))
+                .await?;
+        }
+
+        #[cfg(not(feature = "encryption"))]
         self.reader
-            .seek(SeekFrom::Current(filename_len + extra_len))
+            .seek(SeekFrom::Current(extra_len as i64))
             .await?;
 
         // Create a reader limited to compressed data size
@@ -379,8 +527,9 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
 
             let compression_method = Self::read_u16_le_static(reader).await?;
 
-            // Skip modification time, date, CRC-32
-            reader.seek(SeekFrom::Current(8)).await?;
+            // Read modification time, date, and CRC-32
+            reader.seek(SeekFrom::Current(4)).await?; // mod time + date
+            let crc32 = Self::read_u32_le_static(reader).await?;
 
             // Read sizes as 32-bit placeholders (may be 0xFFFFFFFF meaning ZIP64)
             let compressed_size_32 = Self::read_u32_le_static(reader).await? as u64;
@@ -392,7 +541,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
             // Skip disk number, internal attributes, external attributes
             reader.seek(SeekFrom::Current(8)).await?;
 
-            let mut offset = Self::read_u32_le_static(reader).await? as u64;
+            let offset_32 = Self::read_u32_le_static(reader).await? as u64;
 
             // Read filename
             let mut filename_buf = vec![0u8; filename_len];
@@ -405,74 +554,20 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
                 reader.read_exact(&mut extra_buf).await?;
             }
 
-            // If sizes/offsets are 0xFFFFFFFF, parse ZIP64 extra field (0x0001)
-            let mut compressed_size = compressed_size_32;
-            let mut uncompressed_size = uncompressed_size_32;
-
-            if compressed_size_32 == 0xFFFFFFFF
+            // Resolve ZIP64 placeholders using shared pure helper
+            let (uncompressed_size, compressed_size, offset) = if compressed_size_32 == 0xFFFFFFFF
                 || uncompressed_size_32 == 0xFFFFFFFF
-                || offset == 0xFFFFFFFF
+                || offset_32 == 0xFFFFFFFF
             {
-                // parse extra fields
-                let mut i = 0usize;
-                while i + 4 <= extra_buf.len() {
-                    let id = u16::from_le_bytes([extra_buf[i], extra_buf[i + 1]]);
-                    let data_len =
-                        u16::from_le_bytes([extra_buf[i + 2], extra_buf[i + 3]]) as usize;
-                    i += 4;
-                    if i + data_len > extra_buf.len() {
-                        break;
-                    }
-                    if id == 0x0001 {
-                        // ZIP64 extra field: contains values in order: original size, compressed size, relative header offset, disk start
-                        let mut cursor = 0usize;
-                        // read uncompressed size if placeholder present
-                        if uncompressed_size_32 == 0xFFFFFFFF && cursor + 8 <= data_len {
-                            uncompressed_size = u64::from_le_bytes([
-                                extra_buf[i + cursor],
-                                extra_buf[i + cursor + 1],
-                                extra_buf[i + cursor + 2],
-                                extra_buf[i + cursor + 3],
-                                extra_buf[i + cursor + 4],
-                                extra_buf[i + cursor + 5],
-                                extra_buf[i + cursor + 6],
-                                extra_buf[i + cursor + 7],
-                            ]);
-                            cursor += 8;
-                        }
-                        // read compressed size if placeholder present
-                        if compressed_size_32 == 0xFFFFFFFF && cursor + 8 <= data_len {
-                            compressed_size = u64::from_le_bytes([
-                                extra_buf[i + cursor],
-                                extra_buf[i + cursor + 1],
-                                extra_buf[i + cursor + 2],
-                                extra_buf[i + cursor + 3],
-                                extra_buf[i + cursor + 4],
-                                extra_buf[i + cursor + 5],
-                                extra_buf[i + cursor + 6],
-                                extra_buf[i + cursor + 7],
-                            ]);
-                            cursor += 8;
-                        }
-                        // read offset if placeholder present
-                        if offset == 0xFFFFFFFF && cursor + 8 <= data_len {
-                            offset = u64::from_le_bytes([
-                                extra_buf[i + cursor],
-                                extra_buf[i + cursor + 1],
-                                extra_buf[i + cursor + 2],
-                                extra_buf[i + cursor + 3],
-                                extra_buf[i + cursor + 4],
-                                extra_buf[i + cursor + 5],
-                                extra_buf[i + cursor + 6],
-                                extra_buf[i + cursor + 7],
-                            ]);
-                        }
-                        // we don't need disk start here
-                        break;
-                    }
-                    i += data_len;
-                }
-            }
+                parse_zip64_extra_field(
+                    &extra_buf,
+                    compressed_size_32,
+                    uncompressed_size_32,
+                    offset_32,
+                )
+            } else {
+                (uncompressed_size_32, compressed_size_32, offset_32)
+            };
 
             // Skip comment
             if comment_len > 0 {
@@ -485,6 +580,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
                 uncompressed_size,
                 compression_method,
                 offset,
+                crc32,
                 is_encrypted,
             });
         }
@@ -503,34 +599,8 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await?;
 
-        let mut locator_pos: Option<usize> = None;
-        for i in (0..buffer.len().saturating_sub(3)).rev() {
-            if buffer[i] == 0x50
-                && buffer[i + 1] == 0x4b
-                && buffer[i + 2] == 0x06
-                && buffer[i + 3] == 0x07
-            {
-                locator_pos = Some(i);
-                break;
-            }
-        }
-
-        let locator_pos = locator_pos
+        let zip64_eocd_offset = find_zip64_eocd_offset(&buffer)
             .ok_or_else(|| SZipError::InvalidFormat("ZIP64 EOCD locator not found".to_string()))?;
-
-        // Read locator fields from buffer
-        // locator layout: signature(4), number of the disk with the start of the zip64 eocd(4), relative offset of the zip64 eocd(8), total number of disks(4)
-        let rel_off_bytes = &buffer[locator_pos + 8..locator_pos + 16];
-        let zip64_eocd_offset = u64::from_le_bytes([
-            rel_off_bytes[0],
-            rel_off_bytes[1],
-            rel_off_bytes[2],
-            rel_off_bytes[3],
-            rel_off_bytes[4],
-            rel_off_bytes[5],
-            rel_off_bytes[6],
-            rel_off_bytes[7],
-        ]);
 
         // Seek to ZIP64 EOCD record
         reader.seek(SeekFrom::Start(zip64_eocd_offset)).await?;
@@ -564,7 +634,6 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         {
             let mut buf = [0u8; 8];
             reader.read_exact(&mut buf).await?;
-            // ignore u64::from_le_bytes(buf)
         }
 
         // central directory size (8)
@@ -595,20 +664,9 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await?;
 
-        // Search for EOCD signature from the end
-        for i in (0..buffer.len().saturating_sub(3)).rev() {
-            if buffer[i] == 0x50
-                && buffer[i + 1] == 0x4b
-                && buffer[i + 2] == 0x05
-                && buffer[i + 3] == 0x06
-            {
-                return Ok(search_start + i as u64);
-            }
-        }
-
-        Err(SZipError::InvalidFormat(
-            "End of central directory not found".to_string(),
-        ))
+        find_eocd_in_buffer(&buffer, search_start).ok_or_else(|| {
+            SZipError::InvalidFormat("End of central directory not found".to_string())
+        })
     }
 
     async fn read_u16_le(&mut self) -> Result<u16> {
@@ -633,5 +691,51 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).await?;
         Ok(u32::from_le_bytes(buf))
+    }
+
+    /// Parse the AES extra field (ID 0x9901) from the local file header extra data,
+    /// then read the salt and password-verification bytes that follow the extra field.
+    ///
+    /// Returns `Some((strength, salt, pw_verify))` if AES encryption is present,
+    /// or `None` if no AES extra field is found (extra field is consumed either way).
+    #[cfg(feature = "encryption")]
+    async fn parse_aes_extra_field(
+        &mut self,
+        extra_len: usize,
+    ) -> Result<Option<(crate::encryption::AesStrength, Vec<u8>, [u8; 2])>> {
+        use crate::encryption::AesStrength;
+
+        if extra_len == 0 {
+            return Ok(None);
+        }
+
+        let mut extra_buf = vec![0u8; extra_len];
+        self.reader.read_exact(&mut extra_buf).await?;
+
+        // Use shared pure helper to find the strength code
+        let strength_code = match parse_aes_extra_field_buf(&extra_buf) {
+            Some(code) => code,
+            None => return Ok(None),
+        };
+
+        let strength = match strength_code {
+            0x03 => AesStrength::Aes256,
+            _ => {
+                return Err(SZipError::InvalidFormat(format!(
+                    "Unsupported AES strength code: {}",
+                    strength_code
+                )))
+            }
+        };
+
+        // Salt and password-verify bytes follow the extra field in the file data
+        let salt_size = strength.salt_size();
+        let mut salt = vec![0u8; salt_size];
+        self.reader.read_exact(&mut salt).await?;
+
+        let mut pw_verify = [0u8; 2];
+        self.reader.read_exact(&mut pw_verify).await?;
+
+        Ok(Some((strength, salt, pw_verify)))
     }
 }

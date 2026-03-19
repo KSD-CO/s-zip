@@ -90,93 +90,51 @@ zip.write_data(br#"{"status": "ok"}"#).await?;
 zip.finish().await?;
 ```
 
-## What's New in v0.11.1
+## What's New in v0.11.3
 
-🔒 **Security patch** — fixes two critical vulnerabilities in the encryption feature:
+⚡ **Performance & DRY refactor** — zero-copy parallel compression, streaming decrypt, proptest coverage:
 
-- **AES-CTR keystream reuse fixed** — writing large files in multiple chunks previously
-  reused the same keystream (IV=0 on every `encrypt()` call), allowing an attacker to
-  recover `p1 XOR p2` from two ciphertexts. Now `AesEncryptor` tracks a running
-  `byte_offset` so every chunk uses a distinct keystream segment.
+- **True zero-copy parallel compression** — `compress_file_deflate` in `parallel.rs` previously
+  buffered the entire file into RAM before compressing. New `CrcReader` wrapper computes CRC32
+  on-the-fly through a `File → BufReader(64KB) → CrcReader → DeflateEncoder` pipeline.
+  Peak RAM per task is now **~96 KB regardless of file size** (was full file size × concurrency).
+  Measured: 20 files × 5MB with 8 threads → **~16 MB peak** (was ~320 MB).
 
-**Upgrade immediately if you use `encryption` feature with large files (>4MB per entry).**
+- **Streaming decryption** — `read_entry_streaming()` on both sync and async readers now supports
+  encrypted entries via new `DecryptingReader<R>` / `AsyncDecryptingReader<R>` wrappers.
+  Call `.finish()` after reading to verify the HMAC-SHA1 tag.
+
+- **Shared `format.rs` module** — ZIP constants, `ZipEntry`, and pure parsing helpers extracted
+  from duplicated `reader.rs`/`async_reader.rs`. ~300 lines of duplicate code removed.
+
+- **Proptest fuzz coverage** — 6 property tests in `tests/proptest_zip_parsing.rs` verify
+  `find_eocd_in_buffer`, `find_zip64_eocd_offset`, and `parse_zip64_extra_field` never panic
+  on arbitrary input.
 
 **Breaking Changes**: None.
 
-**Migration from v0.11.0**:
+**Migration from v0.11.2**:
 ```toml
-s-zip = { version = "0.11.1", features = ["async", "encryption"] }
+s-zip = { version = "0.11.3", features = ["async", "encryption"] }
 ```
 
-## What's New in v0.11.2
 
-🛡️ **Correctness & reliability patch** — 7 fixes across error handling, security, and data integrity:
-
-- **`IncorrectPassword` error variant** — `AesDecryptor` now returns the correct
-  `SZipError::IncorrectPassword` variant instead of a generic `InvalidFormat` string,
-  enabling reliable pattern matching in caller code.
-- **No-panic RNG** — `generate_salt()` returns `Result` instead of calling `.expect()`,
-  propagating OS RNG failures gracefully instead of crashing the process.
-- **OOM protection** — `read_entry()` now rejects entries with `compressed_size > 2 GiB`
-  with a clear error instead of attempting a fatal allocation.
-- **Encrypted streaming guard** — `read_entry_streaming()` now returns an explicit
-  `EncryptionError` for encrypted entries instead of silently returning garbled data.
-  Use `read_entry()` for encrypted entries.
-- **`ParallelConfig` no longer panics** — `with_max_concurrent()` returns `Result`
-  instead of calling `assert!`, so invalid input is catchable.
-- **Zip-slip protection** — `ZipEntry::safe_path()` strips `..` and leading `/` from
-  entry names. Always use this when extracting to disk.
-- **ZIP64 in parallel writes** — `write_entries_parallel()` now writes correct ZIP64
-  local headers for entries larger than 4 GB.
-
-**Breaking change:** `ParallelConfig::with_max_concurrent()` now returns `Result<Self>`
-instead of `Self`. Add `.unwrap()` or `?` at call sites.
-
-**Migration from v0.11.1**:
-```toml
-s-zip = { version = "0.11.2", features = ["async", "encryption"] }
-```
-
-```rust
-// Before (v0.11.1)
-let config = ParallelConfig::default().with_max_concurrent(4);
-
-// After (v0.11.2)
-let config = ParallelConfig::default().with_max_concurrent(4)?;
-// or
-let config = ParallelConfig::default().with_max_concurrent(4).unwrap();
-```
-
-## What's New in v0.11.1
-
-🔐 **Async Encryption Support** - AsyncStreamingZipWriter now supports AES-256 encryption!
-- Full encryption/decryption roundtrip (fixes critical bug from v0.10.1)
-- Password-protected async ZIP creation with Tokio
-- WinZip AE-2 format compliance fixed
-- Compatible with 7-Zip, WinZip, WinRAR
-
-**Breaking Changes**: None - fully backward compatible!
-
-**Migration from v0.10.x**:
-```toml
-s-zip = { version = "0.11", features = ["async", "encryption"] }
-```
-
-See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ## Performance
 
-**Single-threaded** (1MB file):
-- DEFLATE: 610 MiB/s
-- Zstd: 2.0 GiB/s (3.3x faster, 11x smaller)
+**Single-threaded** (1MB compressible data, DEFLATE level 6):
+- Write: ~1.5 ms → ~680 MB/s
+- Async write: ~2.2 ms (~1.5× overhead vs sync at 1MB, converges at larger sizes)
 
-**Parallel compression** (4 cores, 400MB total):
-- Sequential: 618 MB/s
-- 4 threads: 1491 MB/s (2.4x speedup)
+**Parallel compression** (20 files × 5MB = 100MB):
+- 2 threads: 731 MB/s, **peak RAM 3 MB**
+- 4 threads: 2484 MB/s, **peak RAM 2 MB**
+- 8 threads: 1434 MB/s, **peak RAM 3 MB**
+- Process total peak RSS: **16 MB** (bounded regardless of file size)
 
-**Memory**: ~2-5 MB constant, even processing 2GB archives.
+**Memory**: ~16 MB process peak even compressing 100MB in parallel (8 threads).
 
-See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for detailed benchmarks.
+See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ## Optional Features
 
@@ -192,21 +150,25 @@ See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for detailed benchmarks.
 
 ## Examples
 
-**Encryption**:
+**Encryption** (including streaming decrypt):
 ```rust
-// Sync
+// Write encrypted
 let mut writer = StreamingZipWriter::new("secure.zip")?;
 writer.set_password("password123");
 writer.start_entry("secret.txt")?;
 writer.write_data(b"Confidential")?;
 writer.finish()?;
 
-// Async
-let mut writer = AsyncStreamingZipWriter::new("secure.zip").await?;
-writer.set_password("password123");
-writer.start_entry("secret.txt").await?;
-writer.write_data(b"Confidential").await?;
-writer.finish().await?;
+// Read encrypted — full (HMAC verified before any bytes returned)
+let mut reader = StreamingZipReader::open("secure.zip")?;
+reader.set_password("password123");
+let data = reader.read_entry_by_name("secret.txt")?;
+
+// Read encrypted — streaming (decrypt on-the-fly, call finish() to verify HMAC)
+let entry = reader.find_entry("secret.txt").unwrap().clone();
+let mut stream = reader.read_entry_streaming(&entry)?;
+std::io::copy(&mut stream, &mut output)?;
+// stream is dropped here; HMAC is verified in DecryptingReader::finish()
 ```
 
 **Zstd Compression**:

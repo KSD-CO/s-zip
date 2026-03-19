@@ -4,84 +4,24 @@
 //! without loading the entire central directory into memory.
 
 use crate::error::{Result, SZipError};
+use crate::format::{
+    find_eocd_in_buffer, find_zip64_eocd_offset, parse_zip64_extra_field,
+    CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_SIGNATURE, LOCAL_FILE_HEADER_SIGNATURE,
+    MAX_ENTRY_ALLOC, ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE,
+};
+
+#[cfg(feature = "encryption")]
+use crate::format::parse_aes_extra_field_buf;
 use flate2::read::DeflateDecoder;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 #[cfg(feature = "encryption")]
 use crate::encryption::{AesDecryptor, AesStrength};
 
-/// ZIP local file header signature
-const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x04034b50;
-
-/// ZIP central directory signature
-const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x02014b50;
-
-/// ZIP end of central directory signature
-const END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06054b50;
-
-/// ZIP64 end of central directory record signature
-const ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06064b50;
-
-/// Maximum single-entry allocation (2 GiB).
-///
-/// Prevents OOM when reading a corrupt or maliciously crafted ZIP that
-/// advertises a huge compressed_size (e.g. u64::MAX) in its central
-/// directory. Entries genuinely larger than this threshold must use the
-/// streaming API (`read_entry_streaming`).
-const MAX_ENTRY_ALLOC: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-
-// ZIP64 end of central directory locator signature (not used as a u32 constant)
-
-/// Entry in the ZIP central directory
-#[derive(Debug, Clone)]
-pub struct ZipEntry {
-    pub name: String,
-    pub compressed_size: u64,
-    pub uncompressed_size: u64,
-    pub compression_method: u16,
-    pub offset: u64,
-    #[cfg(feature = "encryption")]
-    pub is_encrypted: bool,
-}
-
-impl ZipEntry {
-    /// Return a sanitized extraction path that is safe against zip-slip attacks.
-    ///
-    /// Strips:
-    /// - Leading `/` and `\` (absolute paths)
-    /// - Any `..` components (parent directory traversal)
-    /// - Windows drive prefixes (e.g. `C:`)
-    ///
-    /// ```
-    /// # use s_zip::reader::ZipEntry;
-    /// // A malicious entry name like "../../../etc/passwd" becomes "etc/passwd"
-    /// ```
-    ///
-    /// Always use this method when extracting entries to disk. Never use
-    /// `entry.name` directly as a filesystem path.
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use s_zip::StreamingZipReader;
-    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut reader = StreamingZipReader::open("archive.zip")?;
-    /// let output_dir = std::path::Path::new("./output");
-    /// for entry in reader.entries() {
-    ///     let dest = output_dir.join(entry.safe_path());
-    ///     // dest is guaranteed to be inside output_dir
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn safe_path(&self) -> PathBuf {
-        Path::new(&self.name)
-            .components()
-            .filter(|c| matches!(c, Component::Normal(_)))
-            .collect()
-    }
-}
+// Re-export ZipEntry so existing `use s_zip::reader::ZipEntry` paths still compile.
+pub use crate::format::ZipEntry;
 
 /// Streaming ZIP archive reader with adaptive buffering
 pub struct StreamingZipReader {
@@ -310,6 +250,32 @@ impl StreamingZipReader {
             }
         }
 
+        // Verify CRC-32 integrity — catches bit-rot and truncated downloads.
+        // Skip for encrypted entries: the HMAC above already provides stronger
+        // authentication guarantees.
+        #[cfg(not(feature = "encryption"))]
+        {
+            let actual_crc = crc32fast::hash(&data);
+            if entry.crc32 != 0 && actual_crc != entry.crc32 {
+                return Err(SZipError::InvalidFormat(format!(
+                    "CRC-32 mismatch for '{}': expected {:#010x}, got {:#010x}. \
+                     The entry may be corrupt or the download may be incomplete.",
+                    entry.name, entry.crc32, actual_crc
+                )));
+            }
+        }
+        #[cfg(feature = "encryption")]
+        if entry.crc32 != 0 && !entry.is_encrypted {
+            let actual_crc = crc32fast::hash(&data);
+            if actual_crc != entry.crc32 {
+                return Err(SZipError::InvalidFormat(format!(
+                    "CRC-32 mismatch for '{}': expected {:#010x}, got {:#010x}. \
+                     The entry may be corrupt or the download may be incomplete.",
+                    entry.name, entry.crc32, actual_crc
+                )));
+            }
+        }
+
         Ok(data)
     }
 
@@ -334,25 +300,27 @@ impl StreamingZipReader {
         self.read_entry_streaming(&entry)
     }
 
-    /// Get a streaming reader for an entry (for large files)
-    /// Returns a reader that decompresses data on-the-fly without loading everything into memory
+    /// Get a streaming reader for an entry (for large files).
+    ///
+    /// Returns a `Read` impl that decompresses (and, if encrypted, decrypts)
+    /// data on-the-fly without loading the entire entry into memory.
+    ///
+    /// # Encrypted entries
+    ///
+    /// When the `encryption` feature is enabled and the entry is encrypted,
+    /// this method returns a streaming reader that decrypts on-the-fly.
+    /// **Callers must read all bytes and then call `finish()` on the returned
+    /// reader to verify the HMAC-SHA1 authentication tag.**  Because the
+    /// decompressor sits above the decryptor in the pipeline, the HMAC is
+    /// computed over the *compressed ciphertext* bytes rather than the
+    /// decompressed plaintext — this is a known limitation of the streaming
+    /// path.  For full WinZip AE-2 compliance (HMAC over plaintext) use
+    /// `read_entry()` instead.
     ///
     /// # Errors
-    /// Returns `SZipError::EncryptionError` if the entry is encrypted.
-    /// Use `read_entry()` for encrypted entries, which loads the full entry and
-    /// decrypts it. Streaming decryption is tracked in TODO [P2-3].
+    /// Returns `SZipError::EncryptionError` if the entry is encrypted but
+    /// `set_password()` was not called or the password is wrong.
     pub fn read_entry_streaming(&mut self, entry: &ZipEntry) -> Result<Box<dyn Read + '_>> {
-        // Encrypted entries cannot be streamed: we need the full ciphertext to
-        // verify the HMAC auth code before exposing any plaintext.
-        #[cfg(feature = "encryption")]
-        if entry.is_encrypted {
-            return Err(SZipError::EncryptionError(
-                "Streaming read is not supported for encrypted entries. \
-                 Use read_entry() instead, which decrypts and authenticates the full entry."
-                    .to_string(),
-            ));
-        }
-
         // Seek to local file header
         self.file.seek(SeekFrom::Start(entry.offset))?;
 
@@ -370,16 +338,81 @@ impl StreamingZipReader {
         // Skip modification time and date, CRC-32
         self.file.seek(SeekFrom::Current(8))?;
 
-        // Read compressed and uncompressed sizes
+        // Read compressed and uncompressed sizes (use values from central directory)
         self.file.seek(SeekFrom::Current(8))?;
 
         // Read filename length and extra field length
         let filename_len = self.read_u16_le()? as i64;
-        let extra_len = self.read_u16_le()? as i64;
+        let extra_len = self.read_u16_le()? as usize;
 
-        // Skip filename and extra field
-        self.file
-            .seek(SeekFrom::Current(filename_len + extra_len))?;
+        // Skip filename
+        self.file.seek(SeekFrom::Current(filename_len))?;
+
+        // For encrypted entries: parse AES extra field and decrypt on-the-fly.
+        #[cfg(feature = "encryption")]
+        if entry.is_encrypted {
+            let encryption_info = self.parse_aes_extra_field(extra_len)?;
+
+            if let Some((strength, salt, pw_verify)) = encryption_info {
+                let password = self.password.as_ref().ok_or_else(|| {
+                    SZipError::EncryptionError(
+                        "Encrypted entry but no password set. Call set_password() first."
+                            .to_string(),
+                    )
+                })?;
+
+                // Actual ciphertext size: compressed_size minus (salt + pw_verify + auth_code)
+                let overhead = (strength.salt_size() + 2 + 10) as u64;
+                let cipher_size = entry.compressed_size.saturating_sub(overhead);
+
+                // Read the 10-byte auth code positioned after ciphertext.
+                // We must read it now (by seeking past the ciphertext) then
+                // seek back, because limited_reader borrows self.file mutably.
+                // Instead we store auth_code and pass it to DecryptingReader.
+                //
+                // Offset of auth_code = current_pos + cipher_size
+                let current_pos = self.file.stream_position()?;
+                self.file.seek(SeekFrom::Start(current_pos + cipher_size))?;
+                let mut auth_code = vec![0u8; 10];
+                self.file.read_exact(&mut auth_code)?;
+
+                // Seek back to start of ciphertext
+                self.file.seek(SeekFrom::Start(current_pos))?;
+
+                let limited_reader = (&mut self.file).take(cipher_size);
+
+                use crate::decrypt_reader::sync::DecryptingReader;
+                let decrypt_reader = DecryptingReader::new(
+                    limited_reader,
+                    password,
+                    strength,
+                    &salt,
+                    &pw_verify,
+                    auth_code,
+                )?;
+
+                // Wrap with decompressor
+                return if entry.compression_method == 8 {
+                    Ok(Box::new(DeflateDecoder::new(decrypt_reader)))
+                } else if entry.compression_method == 0 {
+                    Ok(Box::new(decrypt_reader))
+                } else {
+                    Err(SZipError::UnsupportedCompression(entry.compression_method))
+                };
+            } else {
+                // Extra field didn't contain AES info — skip it
+                self.file.seek(SeekFrom::Current(extra_len as i64))?;
+            }
+        }
+
+        // Non-encrypted path: skip extra field
+        #[cfg(feature = "encryption")]
+        if !entry.is_encrypted {
+            self.file.seek(SeekFrom::Current(extra_len as i64))?;
+        }
+
+        #[cfg(not(feature = "encryption"))]
+        self.file.seek(SeekFrom::Current(extra_len as i64))?;
 
         // Create a reader limited to compressed data size
         let limited_reader = (&mut self.file).take(entry.compressed_size);
@@ -485,8 +518,9 @@ impl StreamingZipReader {
 
             let compression_method = Self::read_u16_le_static(file)?;
 
-            // Skip modification time, date, CRC-32
-            file.seek(SeekFrom::Current(8))?;
+            // Read modification time, date, and CRC-32
+            file.seek(SeekFrom::Current(4))?; // mod time + date
+            let crc32 = Self::read_u32_le_static(file)?;
 
             // Read sizes as 32-bit placeholders (may be 0xFFFFFFFF meaning ZIP64)
             let compressed_size_32 = Self::read_u32_le_static(file)? as u64;
@@ -498,7 +532,7 @@ impl StreamingZipReader {
             // Skip disk number, internal attributes, external attributes
             file.seek(SeekFrom::Current(8))?;
 
-            let mut offset = Self::read_u32_le_static(file)? as u64;
+            let offset_32 = Self::read_u32_le_static(file)? as u64;
 
             // Read filename
             let mut filename_buf = vec![0u8; filename_len];
@@ -511,74 +545,20 @@ impl StreamingZipReader {
                 file.read_exact(&mut extra_buf)?;
             }
 
-            // If sizes/offsets are 0xFFFFFFFF, parse ZIP64 extra field (0x0001)
-            let mut compressed_size = compressed_size_32;
-            let mut uncompressed_size = uncompressed_size_32;
-
-            if compressed_size_32 == 0xFFFFFFFF
+            // Resolve ZIP64 placeholders using shared pure helper
+            let (uncompressed_size, compressed_size, offset) = if compressed_size_32 == 0xFFFFFFFF
                 || uncompressed_size_32 == 0xFFFFFFFF
-                || offset == 0xFFFFFFFF
+                || offset_32 == 0xFFFFFFFF
             {
-                // parse extra fields
-                let mut i = 0usize;
-                while i + 4 <= extra_buf.len() {
-                    let id = u16::from_le_bytes([extra_buf[i], extra_buf[i + 1]]);
-                    let data_len =
-                        u16::from_le_bytes([extra_buf[i + 2], extra_buf[i + 3]]) as usize;
-                    i += 4;
-                    if i + data_len > extra_buf.len() {
-                        break;
-                    }
-                    if id == 0x0001 {
-                        // ZIP64 extra field: contains values in order: original size, compressed size, relative header offset, disk start
-                        let mut cursor = 0usize;
-                        // read uncompressed size if placeholder present
-                        if uncompressed_size_32 == 0xFFFFFFFF && cursor + 8 <= data_len {
-                            uncompressed_size = u64::from_le_bytes([
-                                extra_buf[i + cursor],
-                                extra_buf[i + cursor + 1],
-                                extra_buf[i + cursor + 2],
-                                extra_buf[i + cursor + 3],
-                                extra_buf[i + cursor + 4],
-                                extra_buf[i + cursor + 5],
-                                extra_buf[i + cursor + 6],
-                                extra_buf[i + cursor + 7],
-                            ]);
-                            cursor += 8;
-                        }
-                        // read compressed size if placeholder present
-                        if compressed_size_32 == 0xFFFFFFFF && cursor + 8 <= data_len {
-                            compressed_size = u64::from_le_bytes([
-                                extra_buf[i + cursor],
-                                extra_buf[i + cursor + 1],
-                                extra_buf[i + cursor + 2],
-                                extra_buf[i + cursor + 3],
-                                extra_buf[i + cursor + 4],
-                                extra_buf[i + cursor + 5],
-                                extra_buf[i + cursor + 6],
-                                extra_buf[i + cursor + 7],
-                            ]);
-                            cursor += 8;
-                        }
-                        // read offset if placeholder present
-                        if offset == 0xFFFFFFFF && cursor + 8 <= data_len {
-                            offset = u64::from_le_bytes([
-                                extra_buf[i + cursor],
-                                extra_buf[i + cursor + 1],
-                                extra_buf[i + cursor + 2],
-                                extra_buf[i + cursor + 3],
-                                extra_buf[i + cursor + 4],
-                                extra_buf[i + cursor + 5],
-                                extra_buf[i + cursor + 6],
-                                extra_buf[i + cursor + 7],
-                            ]);
-                        }
-                        // we don't need disk start here
-                        break;
-                    }
-                    i += data_len;
-                }
-            }
+                parse_zip64_extra_field(
+                    &extra_buf,
+                    compressed_size_32,
+                    uncompressed_size_32,
+                    offset_32,
+                )
+            } else {
+                (uncompressed_size_32, compressed_size_32, offset_32)
+            };
 
             // Skip comment
             if comment_len > 0 {
@@ -591,7 +571,7 @@ impl StreamingZipReader {
                 uncompressed_size,
                 compression_method,
                 offset,
-                #[cfg(feature = "encryption")]
+                crc32,
                 is_encrypted: (flags & 0x01) != 0,
             });
         }
@@ -607,34 +587,8 @@ impl StreamingZipReader {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
-        let mut locator_pos: Option<usize> = None;
-        for i in (0..buffer.len().saturating_sub(3)).rev() {
-            if buffer[i] == 0x50
-                && buffer[i + 1] == 0x4b
-                && buffer[i + 2] == 0x06
-                && buffer[i + 3] == 0x07
-            {
-                locator_pos = Some(i);
-                break;
-            }
-        }
-
-        let locator_pos = locator_pos
+        let zip64_eocd_offset = find_zip64_eocd_offset(&buffer)
             .ok_or_else(|| SZipError::InvalidFormat("ZIP64 EOCD locator not found".to_string()))?;
-
-        // Read locator fields from buffer
-        // locator layout: signature(4), number of the disk with the start of the zip64 eocd(4), relative offset of the zip64 eocd(8), total number of disks(4)
-        let rel_off_bytes = &buffer[locator_pos + 8..locator_pos + 16];
-        let zip64_eocd_offset = u64::from_le_bytes([
-            rel_off_bytes[0],
-            rel_off_bytes[1],
-            rel_off_bytes[2],
-            rel_off_bytes[3],
-            rel_off_bytes[4],
-            rel_off_bytes[5],
-            rel_off_bytes[6],
-            rel_off_bytes[7],
-        ]);
 
         // Seek to ZIP64 EOCD record
         file.seek(SeekFrom::Start(zip64_eocd_offset))?;
@@ -668,7 +622,6 @@ impl StreamingZipReader {
         {
             let mut buf = [0u8; 8];
             file.read_exact(&mut buf)?;
-            // ignore u64::from_le_bytes(buf)
         }
 
         // central directory size (8)
@@ -699,20 +652,9 @@ impl StreamingZipReader {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
-        // Search for EOCD signature from the end
-        for i in (0..buffer.len().saturating_sub(3)).rev() {
-            if buffer[i] == 0x50
-                && buffer[i + 1] == 0x4b
-                && buffer[i + 2] == 0x05
-                && buffer[i + 3] == 0x06
-            {
-                return Ok(search_start + i as u64);
-            }
-        }
-
-        Err(SZipError::InvalidFormat(
-            "End of central directory not found".to_string(),
-        ))
+        find_eocd_in_buffer(&buffer, search_start).ok_or_else(|| {
+            SZipError::InvalidFormat("End of central directory not found".to_string())
+        })
     }
 
     fn read_u16_le(&mut self) -> Result<u16> {
@@ -753,55 +695,32 @@ impl StreamingZipReader {
         let mut extra_buf = vec![0u8; extra_len];
         self.file.read_exact(&mut extra_buf)?;
 
-        // Parse extra fields looking for AES extra (0x9901)
-        let mut i = 0usize;
-        while i + 4 <= extra_buf.len() {
-            let id = u16::from_le_bytes([extra_buf[i], extra_buf[i + 1]]);
-            let data_len = u16::from_le_bytes([extra_buf[i + 2], extra_buf[i + 3]]) as usize;
-            i += 4;
+        // Use shared pure helper to find the strength code
+        let strength_code = match parse_aes_extra_field_buf(&extra_buf) {
+            Some(code) => code,
+            None => return Ok(None),
+        };
 
-            if i + data_len > extra_buf.len() {
-                break;
+        let strength = match strength_code {
+            0x03 => AesStrength::Aes256,
+            _ => {
+                return Err(SZipError::InvalidFormat(format!(
+                    "Unsupported AES strength: {}",
+                    strength_code
+                )))
             }
+        };
 
-            if id == 0x9901 {
-                // WinZip AES encryption extra field
-                // Layout: version(2) + vendor(2) + strength(2) + compression(2) + salt + pwverify(2)
+        // Read salt and password verification from actual file data (not extra field)
+        // Salt comes after the extra field, before compressed data
+        let salt_size = strength.salt_size();
 
-                if data_len < 7 {
-                    return Err(SZipError::InvalidFormat(
-                        "Invalid AES extra field".to_string(),
-                    ));
-                }
+        let mut salt = vec![0u8; salt_size];
+        self.file.read_exact(&mut salt)?;
 
-                let strength_code = extra_buf[i + 4]; // AES strength is 1 byte, not 2!
+        let mut pw_verify = [0u8; 2];
+        self.file.read_exact(&mut pw_verify)?;
 
-                let strength = match strength_code {
-                    0x03 => AesStrength::Aes256,
-                    _ => {
-                        return Err(SZipError::InvalidFormat(format!(
-                            "Unsupported AES strength: {}",
-                            strength_code
-                        )))
-                    }
-                };
-
-                // Read salt and password verification from actual file data (not extra field)
-                // Salt comes after the extra field, before compressed data
-                let salt_size = strength.salt_size();
-
-                let mut salt = vec![0u8; salt_size];
-                self.file.read_exact(&mut salt)?;
-
-                let mut pw_verify = [0u8; 2];
-                self.file.read_exact(&mut pw_verify)?;
-
-                return Ok(Some((strength, salt, pw_verify)));
-            }
-
-            i += data_len;
-        }
-
-        Ok(None)
+        Ok(Some((strength, salt, pw_verify)))
     }
 }
