@@ -7,7 +7,7 @@ use crate::error::{Result, SZipError};
 use flate2::read::DeflateDecoder;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(feature = "encryption")]
 use crate::encryption::{AesDecryptor, AesStrength};
@@ -24,6 +24,14 @@ const END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06054b50;
 /// ZIP64 end of central directory record signature
 const ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06064b50;
 
+/// Maximum single-entry allocation (2 GiB).
+///
+/// Prevents OOM when reading a corrupt or maliciously crafted ZIP that
+/// advertises a huge compressed_size (e.g. u64::MAX) in its central
+/// directory. Entries genuinely larger than this threshold must use the
+/// streaming API (`read_entry_streaming`).
+const MAX_ENTRY_ALLOC: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 // ZIP64 end of central directory locator signature (not used as a u32 constant)
 
 /// Entry in the ZIP central directory
@@ -36,6 +44,43 @@ pub struct ZipEntry {
     pub offset: u64,
     #[cfg(feature = "encryption")]
     pub is_encrypted: bool,
+}
+
+impl ZipEntry {
+    /// Return a sanitized extraction path that is safe against zip-slip attacks.
+    ///
+    /// Strips:
+    /// - Leading `/` and `\` (absolute paths)
+    /// - Any `..` components (parent directory traversal)
+    /// - Windows drive prefixes (e.g. `C:`)
+    ///
+    /// ```
+    /// # use s_zip::reader::ZipEntry;
+    /// // A malicious entry name like "../../../etc/passwd" becomes "etc/passwd"
+    /// ```
+    ///
+    /// Always use this method when extracting entries to disk. Never use
+    /// `entry.name` directly as a filesystem path.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::StreamingZipReader;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut reader = StreamingZipReader::open("archive.zip")?;
+    /// let output_dir = std::path::Path::new("./output");
+    /// for entry in reader.entries() {
+    ///     let dest = output_dir.join(entry.safe_path());
+    ///     // dest is guaranteed to be inside output_dir
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn safe_path(&self) -> PathBuf {
+        Path::new(&self.name)
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .collect()
+    }
 }
 
 /// Streaming ZIP archive reader with adaptive buffering
@@ -187,6 +232,16 @@ impl StreamingZipReader {
         #[cfg(not(feature = "encryption"))]
         let data_size = entry.compressed_size;
 
+        // Guard against OOM from corrupt/malicious compressed_size values.
+        // Entries larger than 2 GiB must use read_entry_streaming() instead.
+        if data_size > MAX_ENTRY_ALLOC {
+            return Err(SZipError::InvalidFormat(format!(
+                "Entry '{}' is too large to read into memory ({} bytes). \
+                 Use read_entry_streaming() for entries larger than 2 GiB.",
+                entry.name, data_size
+            )));
+        }
+
         // Now read the compressed data
         let mut compressed_data = vec![0u8; data_size as usize];
         self.file.read_exact(&mut compressed_data)?;
@@ -281,7 +336,23 @@ impl StreamingZipReader {
 
     /// Get a streaming reader for an entry (for large files)
     /// Returns a reader that decompresses data on-the-fly without loading everything into memory
+    ///
+    /// # Errors
+    /// Returns `SZipError::EncryptionError` if the entry is encrypted.
+    /// Use `read_entry()` for encrypted entries, which loads the full entry and
+    /// decrypts it. Streaming decryption is tracked in TODO [P2-3].
     pub fn read_entry_streaming(&mut self, entry: &ZipEntry) -> Result<Box<dyn Read + '_>> {
+        // Encrypted entries cannot be streamed: we need the full ciphertext to
+        // verify the HMAC auth code before exposing any plaintext.
+        #[cfg(feature = "encryption")]
+        if entry.is_encrypted {
+            return Err(SZipError::EncryptionError(
+                "Streaming read is not supported for encrypted entries. \
+                 Use read_entry() instead, which decrypts and authenticates the full entry."
+                    .to_string(),
+            ));
+        }
+
         // Seek to local file header
         self.file.seek(SeekFrom::Start(entry.offset))?;
 

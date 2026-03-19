@@ -8,7 +8,7 @@ use async_compression::tokio::bufread::DeflateDecoder;
 #[cfg(feature = "async-zstd")]
 use async_compression::tokio::bufread::ZstdDecoder;
 use std::io::SeekFrom;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader};
 
@@ -24,6 +24,9 @@ const END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06054b50;
 /// ZIP64 end of central directory record signature
 const ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06064b50;
 
+/// Maximum single-entry allocation (2 GiB). Mirrors reader.rs.
+const MAX_ENTRY_ALLOC: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 /// Entry in the ZIP central directory
 #[derive(Debug, Clone)]
 pub struct ZipEntry {
@@ -32,6 +35,20 @@ pub struct ZipEntry {
     pub uncompressed_size: u64,
     pub compression_method: u16,
     pub offset: u64,
+    /// True if general-purpose bit 0 (encryption flag) is set.
+    pub is_encrypted: bool,
+}
+
+impl ZipEntry {
+    /// Return a sanitized extraction path safe against zip-slip attacks.
+    /// Strips leading `/`, `\`, `..`, and Windows drive prefixes.
+    /// See `reader::ZipEntry::safe_path()` for full documentation.
+    pub fn safe_path(&self) -> PathBuf {
+        Path::new(&self.name)
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .collect()
+    }
 }
 
 /// Generic async streaming ZIP reader that works with any async reader + seeker
@@ -140,6 +157,15 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
             .seek(SeekFrom::Current(filename_len + extra_len))
             .await?;
 
+        // Guard against OOM from corrupt/malicious compressed_size values.
+        if entry.compressed_size > MAX_ENTRY_ALLOC {
+            return Err(SZipError::InvalidFormat(format!(
+                "Entry '{}' is too large to read into memory ({} bytes). \
+                 Use read_entry_streaming() for entries larger than 2 GiB.",
+                entry.name, entry.compressed_size
+            )));
+        }
+
         // Now read the compressed data
         let mut compressed_data = vec![0u8; entry.compressed_size as usize];
         self.reader.read_exact(&mut compressed_data).await?;
@@ -200,10 +226,23 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
 
     /// Get a streaming reader for an entry (for large files)
     /// Returns a reader that decompresses data on-the-fly without loading everything into memory
+    ///
+    /// # Errors
+    /// Returns `SZipError::EncryptionError` if the entry is encrypted.
+    /// Use `read_entry()` for encrypted entries.
     pub async fn read_entry_streaming(
         &mut self,
         entry: &ZipEntry,
     ) -> Result<Box<dyn AsyncRead + Unpin + Send + '_>> {
+        // Encrypted entries cannot be streamed safely without HMAC verification.
+        if entry.is_encrypted {
+            return Err(SZipError::EncryptionError(
+                "Streaming read is not supported for encrypted entries. \
+                 Use read_entry() instead, which decrypts and authenticates the full entry."
+                    .to_string(),
+            ));
+        }
+
         // Seek to local file header
         self.reader.seek(SeekFrom::Start(entry.offset)).await?;
 
@@ -332,8 +371,10 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
                 break;
             }
 
-            // Skip version made by, version needed, flags
-            reader.seek(SeekFrom::Current(6)).await?;
+            // Skip version made by (2), version needed (2); read flags (2)
+            reader.seek(SeekFrom::Current(4)).await?;
+            let flags = Self::read_u16_le_static(reader).await?;
+            let is_encrypted = (flags & 0x01) != 0;
 
             let compression_method = Self::read_u16_le_static(reader).await?;
 
@@ -443,6 +484,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
                 uncompressed_size,
                 compression_method,
                 offset,
+                is_encrypted,
             });
         }
 
