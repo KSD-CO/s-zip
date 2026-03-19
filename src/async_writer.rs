@@ -723,23 +723,49 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             // Write local file header
             let local_header_offset = self.output.stream_position().await?;
 
+            let compressed_size = entry.data.len() as u64;
+            let uncompressed_size = entry.uncompressed_size;
+            let needs_zip64 =
+                compressed_size > u32::MAX as u64 || uncompressed_size > u32::MAX as u64;
+
             self.output.write_all(&[0x50, 0x4b, 0x03, 0x04]).await?; // local file header sig
-            self.output.write_all(&[20, 0]).await?; // version needed
+            // version needed: 4.5 (ZIP64) or 2.0 (standard)
+            let version_needed: u16 = if needs_zip64 { 45 } else { 20 };
+            self.output.write_all(&version_needed.to_le_bytes()).await?;
             self.output.write_all(&[8, 0]).await?; // general purpose bit flag (bit 3 set)
             self.output.write_all(&[8, 0]).await?; // compression method (DEFLATE)
             self.output.write_all(&[0, 0, 0, 0]).await?; // mod time/date
             self.output.write_all(&entry.crc32.to_le_bytes()).await?;
-            self.output
-                .write_all(&(entry.data.len() as u32).to_le_bytes())
-                .await?; // compressed size
-            self.output
-                .write_all(&(entry.uncompressed_size as u32).to_le_bytes())
-                .await?; // uncompressed size
+
+            if needs_zip64 {
+                // Use 0xFFFFFFFF placeholder; real sizes in ZIP64 extra field
+                self.output.write_all(&0xFFFFFFFFu32.to_le_bytes()).await?; // compressed size
+                self.output.write_all(&0xFFFFFFFFu32.to_le_bytes()).await?; // uncompressed size
+            } else {
+                self.output
+                    .write_all(&(compressed_size as u32).to_le_bytes())
+                    .await?;
+                self.output
+                    .write_all(&(uncompressed_size as u32).to_le_bytes())
+                    .await?;
+            }
+
             self.output
                 .write_all(&(entry.name.len() as u16).to_le_bytes())
                 .await?; // filename length
-            self.output.write_all(&0u16.to_le_bytes()).await?; // extra field length
+
+            // ZIP64 extra field (28 bytes) or no extra field
+            let extra_len: u16 = if needs_zip64 { 20 } else { 0 };
+            self.output.write_all(&extra_len.to_le_bytes()).await?;
             self.output.write_all(entry.name.as_bytes()).await?;
+
+            if needs_zip64 {
+                // ZIP64 extended information extra field (ID 0x0001)
+                self.output.write_all(&0x0001u16.to_le_bytes()).await?; // header ID
+                self.output.write_all(&16u16.to_le_bytes()).await?; // data size (2×8 bytes)
+                self.output.write_all(&uncompressed_size.to_le_bytes()).await?;
+                self.output.write_all(&compressed_size.to_le_bytes()).await?;
+            }
 
             // Write compressed data
             self.output.write_all(&entry.data).await?;
@@ -749,8 +775,8 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 name: entry.name,
                 local_header_offset,
                 crc32: entry.crc32,
-                compressed_size: entry.data.len() as u64,
-                uncompressed_size: entry.uncompressed_size,
+                compressed_size,
+                uncompressed_size,
                 compression_method: 8, // DEFLATE
                 #[cfg(feature = "encryption")]
                 encryption_strength: None, // Parallel compression doesn't support encryption yet

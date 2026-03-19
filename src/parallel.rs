@@ -57,12 +57,23 @@ impl ParallelConfig {
         }
     }
 
-    /// Set max concurrent tasks
-    pub fn with_max_concurrent(mut self, max: usize) -> Self {
-        assert!(max > 0, "max_concurrent must be at least 1");
-        assert!(max <= 16, "max_concurrent should not exceed 16");
+    /// Set max concurrent tasks (1–16).
+    ///
+    /// Returns `Err` instead of panicking so callers can handle invalid input
+    /// without crashing the process.
+    pub fn with_max_concurrent(mut self, max: usize) -> crate::error::Result<Self> {
+        if max == 0 {
+            return Err(crate::error::SZipError::InvalidFormat(
+                "max_concurrent must be at least 1".to_string(),
+            ));
+        }
+        if max > 16 {
+            return Err(crate::error::SZipError::InvalidFormat(
+                "max_concurrent must not exceed 16".to_string(),
+            ));
+        }
         self.max_concurrent = max;
-        self
+        Ok(self)
     }
 
     /// Set compression level
@@ -232,14 +243,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "max_concurrent must be at least 1")]
     fn test_invalid_max_concurrent_zero() {
-        ParallelConfig::default().with_max_concurrent(0);
+        let result = ParallelConfig::default().with_max_concurrent(0);
+        assert!(result.is_err(), "Expected error for max_concurrent=0");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("at least 1"), "Error should mention minimum: {}", msg);
     }
 
     #[test]
-    #[should_panic(expected = "max_concurrent should not exceed 16")]
     fn test_invalid_max_concurrent_too_high() {
-        ParallelConfig::default().with_max_concurrent(20);
+        let result = ParallelConfig::default().with_max_concurrent(20);
+        assert!(result.is_err(), "Expected error for max_concurrent=20");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("16"), "Error should mention maximum: {}", msg);
+    }
+
+    #[test]
+    fn test_valid_max_concurrent() {
+        let config = ParallelConfig::default().with_max_concurrent(8).unwrap();
+        assert_eq!(config.max_concurrent, 8);
     }
 }
