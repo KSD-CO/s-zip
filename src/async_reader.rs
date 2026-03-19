@@ -235,6 +235,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         entry: &ZipEntry,
     ) -> Result<Box<dyn AsyncRead + Unpin + Send + '_>> {
         // Encrypted entries cannot be streamed safely without HMAC verification.
+        #[cfg(feature = "encryption")]
         if entry.is_encrypted {
             return Err(SZipError::EncryptionError(
                 "Streaming read is not supported for encrypted entries. \
