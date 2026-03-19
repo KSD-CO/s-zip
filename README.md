@@ -108,7 +108,46 @@ zip.finish().await?;
 s-zip = { version = "0.11.1", features = ["async", "encryption"] }
 ```
 
-## What's New in v0.11.0
+## What's New in v0.11.2
+
+🛡️ **Correctness & reliability patch** — 7 fixes across error handling, security, and data integrity:
+
+- **`IncorrectPassword` error variant** — `AesDecryptor` now returns the correct
+  `SZipError::IncorrectPassword` variant instead of a generic `InvalidFormat` string,
+  enabling reliable pattern matching in caller code.
+- **No-panic RNG** — `generate_salt()` returns `Result` instead of calling `.expect()`,
+  propagating OS RNG failures gracefully instead of crashing the process.
+- **OOM protection** — `read_entry()` now rejects entries with `compressed_size > 2 GiB`
+  with a clear error instead of attempting a fatal allocation.
+- **Encrypted streaming guard** — `read_entry_streaming()` now returns an explicit
+  `EncryptionError` for encrypted entries instead of silently returning garbled data.
+  Use `read_entry()` for encrypted entries.
+- **`ParallelConfig` no longer panics** — `with_max_concurrent()` returns `Result`
+  instead of calling `assert!`, so invalid input is catchable.
+- **Zip-slip protection** — `ZipEntry::safe_path()` strips `..` and leading `/` from
+  entry names. Always use this when extracting to disk.
+- **ZIP64 in parallel writes** — `write_entries_parallel()` now writes correct ZIP64
+  local headers for entries larger than 4 GB.
+
+**Breaking change:** `ParallelConfig::with_max_concurrent()` now returns `Result<Self>`
+instead of `Self`. Add `.unwrap()` or `?` at call sites.
+
+**Migration from v0.11.1**:
+```toml
+s-zip = { version = "0.11.2", features = ["async", "encryption"] }
+```
+
+```rust
+// Before (v0.11.1)
+let config = ParallelConfig::default().with_max_concurrent(4);
+
+// After (v0.11.2)
+let config = ParallelConfig::default().with_max_concurrent(4)?;
+// or
+let config = ParallelConfig::default().with_max_concurrent(4).unwrap();
+```
+
+## What's New in v0.11.1
 
 🔐 **Async Encryption Support** - AsyncStreamingZipWriter now supports AES-256 encryption!
 - Full encryption/decryption roundtrip (fixes critical bug from v0.10.1)

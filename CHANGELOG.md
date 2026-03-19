@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] - 2026-03-19
+
+### Fixed 🐛
+
+- **Return `SZipError::IncorrectPassword` from `AesDecryptor::new()`** (`src/encryption.rs`)
+
+  Password verification failure previously returned `InvalidFormat("Incorrect password")`,
+  making it impossible to pattern-match reliably. Now returns the purpose-built
+  `SZipError::IncorrectPassword` variant.
+
+- **`generate_salt()` no longer panics** (`src/encryption.rs`)
+
+  Changed return type from `Vec<u8>` to `Result<Vec<u8>>`. OS RNG failures
+  (`getrandom` error) are now propagated as `SZipError::EncryptionError` instead of
+  crashing the process with `.expect()`.
+
+- **OOM guard in `read_entry()`** (`src/reader.rs`, `src/async_reader.rs`)
+
+  Added `MAX_ENTRY_ALLOC = 2 GiB` cap before allocating the compressed data buffer.
+  A corrupt or malicious ZIP advertising `compressed_size = u64::MAX` previously caused
+  an immediate out-of-memory crash. Now returns `SZipError::InvalidFormat` with a clear
+  message directing users to `read_entry_streaming()` for large entries.
+
+- **Encrypted entries rejected in `read_entry_streaming()`** (`src/reader.rs`, `src/async_reader.rs`)
+
+  Calling `read_entry_streaming()` on an encrypted entry previously returned a stream
+  of garbled bytes with no indication of the problem. Now returns
+  `SZipError::EncryptionError` immediately, directing callers to `read_entry()`.
+  Also added `is_encrypted: bool` field to `async_reader::ZipEntry` (was missing).
+
+- **ZIP64 headers in `write_entries_parallel()`** (`src/async_writer.rs`)
+
+  Parallel-compressed entries larger than 4 GB previously used `data.len() as u32`,
+  silently truncating the size fields and producing an unreadable ZIP. Now writes
+  correct ZIP64 local headers (version needed = 4.5, extra field ID 0x0001) when
+  `compressed_size > u32::MAX || uncompressed_size > u32::MAX`.
+
+### Changed ⚠️
+
+- **`ParallelConfig::with_max_concurrent()` returns `Result<Self>`** (`src/parallel.rs`)
+
+  Previously panicked via `assert!` on invalid input (0 or >16). Now returns
+  `Err(SZipError::InvalidFormat)` so callers can handle the error without crashing.
+
+  **Migration:** add `.unwrap()` or `?` at existing call sites.
+
+### Added ✅
+
+- **`ZipEntry::safe_path()`** (`src/reader.rs`, `src/async_reader.rs`)
+
+  New method on `ZipEntry` that returns a `PathBuf` with all `..` components,
+  leading `/`/`\`, and Windows drive prefixes stripped. Protects against zip-slip
+  directory traversal attacks when extracting to disk. Always use this instead of
+  `entry.name` when constructing destination paths.
+
+  ```rust
+  let dest = output_dir.join(entry.safe_path()); // safe
+  let dest = output_dir.join(&entry.name);        // unsafe — don't do this
+  ```
+
+- **`examples/memory_test_encryption.rs`** — peak-memory test for the multi-chunk
+  encrypted write path. Verified: 50 MB input / 5×10 MB chunks peaks at ~12.5 MB RSS.
+
 ## [0.11.1] - 2026-03-19
 
 ### Security 🔒
