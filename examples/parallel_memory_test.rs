@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(path, name)| ParallelEntry::new(name.clone(), path.clone()))
         .collect();
 
-    let config = ParallelConfig::default().with_max_concurrent(1);
+    let config = ParallelConfig::default().with_max_concurrent(1).unwrap();
     writer.write_entries_parallel(entries, config).await?;
 
     let mem_peak_seq = get_memory_usage_mb();

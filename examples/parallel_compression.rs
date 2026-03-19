@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let configs = vec![
         (
             "Sequential (1 thread)",
-            ParallelConfig::default().with_max_concurrent(1),
+            ParallelConfig::default().with_max_concurrent(1).unwrap(),
         ),
         ("Conservative (2 threads)", ParallelConfig::conservative()),
         ("Balanced (4 threads)", ParallelConfig::balanced()),

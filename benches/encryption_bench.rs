@@ -109,6 +109,53 @@ fn bench_encryption(_c: &mut Criterion) {}
 #[cfg(not(feature = "encryption"))]
 fn bench_memory_usage(_c: &mut Criterion) {}
 
+#[cfg(feature = "encryption")]
+fn bench_multi_chunk_encryption(c: &mut Criterion) {
+    // Benchmarks the fixed CTR path: write_data called N times per entry.
+    // Before the fix each chunk restarted from IV=0 (corrupt ciphertext).
+    // After the fix byte_offset advances correctly — this measures the overhead
+    // of the partial-block fast-forward logic.
+    let mut group = c.benchmark_group("multi_chunk_encryption");
+
+    // 5 × 1MB chunks = 5MB total — triggers multiple flush cycles
+    let chunk = generate_data(1024 * 1024); // 1MB per call
+    let n_chunks = 5usize;
+
+    group.throughput(Throughput::Bytes((chunk.len() * n_chunks) as u64));
+
+    group.bench_function("5x1mb_no_encryption", |b| {
+        b.iter(|| {
+            let buffer = Vec::new();
+            let cursor = Cursor::new(buffer);
+            let mut writer = StreamingZipWriter::from_writer(cursor).unwrap();
+            writer.start_entry("large.bin").unwrap();
+            for _ in 0..n_chunks {
+                writer.write_data(black_box(&chunk)).unwrap();
+            }
+            writer.finish().unwrap()
+        });
+    });
+
+    group.bench_function("5x1mb_aes256_encryption", |b| {
+        b.iter(|| {
+            let buffer = Vec::new();
+            let cursor = Cursor::new(buffer);
+            let mut writer = StreamingZipWriter::from_writer(cursor).unwrap();
+            writer.set_password("benchmark_password_123");
+            writer.start_entry("large.bin").unwrap();
+            for _ in 0..n_chunks {
+                writer.write_data(black_box(&chunk)).unwrap();
+            }
+            writer.finish().unwrap()
+        });
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "encryption"))]
+fn bench_multi_chunk_encryption(_c: &mut Criterion) {}
+
 #[cfg(not(feature = "encryption"))]
 fn bench_pbkdf2_overhead(_c: &mut Criterion) {}
 
@@ -116,6 +163,7 @@ criterion_group!(
     benches,
     bench_encryption,
     bench_memory_usage,
-    bench_pbkdf2_overhead
+    bench_pbkdf2_overhead,
+    bench_multi_chunk_encryption
 );
 criterion_main!(benches);
