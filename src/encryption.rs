@@ -93,8 +93,8 @@ pub struct AesEncryptor {
 impl AesEncryptor {
     /// Create a new AES encryptor with the given password
     pub fn new(password: &str, strength: AesStrength) -> Result<Self> {
-        // Generate random salt
-        let salt = generate_salt(strength.salt_size());
+        // Generate random salt — returns Err rather than panicking on RNG failure
+        let salt = generate_salt(strength.salt_size())?;
 
         // Derive keys using PBKDF2-HMAC-SHA1 with 1000 iterations
         let derived_key_size = strength.derived_key_size();
@@ -232,7 +232,7 @@ impl AesDecryptor {
 
         // Verify password immediately
         if &expected_pw_verify != password_verify {
-            return Err(SZipError::InvalidFormat("Incorrect password".to_string()));
+            return Err(SZipError::IncorrectPassword);
         }
 
         // Initialize HMAC for authentication
@@ -293,29 +293,22 @@ impl AesDecryptor {
     }
 }
 
-/// Generate cryptographically secure random salt
-fn generate_salt(size: usize) -> Vec<u8> {
-    // Use OS CSPRNG via `getrandom` crate when available. This is the
-    // recommended secure source of randomness for salts in cryptographic
-    // operations.
+/// Generate cryptographically secure random salt.
+///
+/// Returns `Err(SZipError::EncryptionError)` if the OS CSPRNG is unavailable,
+/// rather than panicking — libraries must never panic on external failures.
+fn generate_salt(size: usize) -> Result<Vec<u8>> {
     #[cfg(feature = "encryption")]
     {
         let mut salt = vec![0u8; size];
-        // getrandom should not fail on a normal OS; map failure to panic in
-        // this unlikely event. Library constructors return `Result`, so any
-        // error during initialization will be propagated from callers.
-        getrandom::getrandom(&mut salt).expect("getrandom failed to generate salt");
-        salt
+        getrandom::getrandom(&mut salt).map_err(|e| {
+            SZipError::EncryptionError(format!("Failed to generate random salt: {}", e))
+        })?;
+        Ok(salt)
     }
 
-    // Fallback for builds without `getrandom` feature (shouldn't occur
-    // because the `encryption` feature enables `getrandom` in Cargo.toml).
     #[cfg(not(feature = "encryption"))]
     {
-        // As a safe fallback, use the platform RNG from the standard library's
-        // randomness support via `rand` is preferred, but to avoid adding an
-        // extra dependency here, fall back to a simple time-based seed. This
-        // branch is only used when encryption feature is disabled.
         use std::time::{SystemTime, UNIX_EPOCH};
         let mut salt = vec![0u8; size];
         let seed = SystemTime::now()
@@ -327,7 +320,7 @@ fn generate_salt(size: usize) -> Vec<u8> {
             *byte = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(i as u64)) % 256) as u8;
         }
 
-        salt
+        Ok(salt)
     }
 }
 
