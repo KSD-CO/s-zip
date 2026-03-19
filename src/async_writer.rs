@@ -729,7 +729,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 compressed_size > u32::MAX as u64 || uncompressed_size > u32::MAX as u64;
 
             self.output.write_all(&[0x50, 0x4b, 0x03, 0x04]).await?; // local file header sig
-            // version needed: 4.5 (ZIP64) or 2.0 (standard)
+                                                                     // version needed: 4.5 (ZIP64) or 2.0 (standard)
             let version_needed: u16 = if needs_zip64 { 45 } else { 20 };
             self.output.write_all(&version_needed.to_le_bytes()).await?;
             self.output.write_all(&[8, 0]).await?; // general purpose bit flag (bit 3 set)
@@ -763,8 +763,12 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 // ZIP64 extended information extra field (ID 0x0001)
                 self.output.write_all(&0x0001u16.to_le_bytes()).await?; // header ID
                 self.output.write_all(&16u16.to_le_bytes()).await?; // data size (2×8 bytes)
-                self.output.write_all(&uncompressed_size.to_le_bytes()).await?;
-                self.output.write_all(&compressed_size.to_le_bytes()).await?;
+                self.output
+                    .write_all(&uncompressed_size.to_le_bytes())
+                    .await?;
+                self.output
+                    .write_all(&compressed_size.to_le_bytes())
+                    .await?;
             }
 
             // Write compressed data

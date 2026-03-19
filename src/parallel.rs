@@ -247,7 +247,11 @@ mod tests {
         let result = ParallelConfig::default().with_max_concurrent(0);
         assert!(result.is_err(), "Expected error for max_concurrent=0");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("at least 1"), "Error should mention minimum: {}", msg);
+        assert!(
+            msg.contains("at least 1"),
+            "Error should mention minimum: {}",
+            msg
+        );
     }
 
     #[test]
