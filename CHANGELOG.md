@@ -5,7 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.1] - 2026-02-08
+## [0.11.1] - 2026-03-19
+
+### Security 🔒
+
+- **Fixed: AES-CTR keystream reuse on multi-chunk writes** (`src/encryption.rs`)
+
+  `AesEncryptor::encrypt()` was creating a new AES-CTR cipher with IV=0 on
+  every call. When a large file triggered multiple internal buffer flushes
+  (entries larger than the adaptive flush threshold, typically 2–8 MB), each
+  chunk was encrypted with the *same* keystream starting at counter=0.
+  An attacker with two ciphertexts from the same key could recover
+  `plaintext1 XOR plaintext2` by XOR-ing the ciphertexts.
+
+  **Fix:** Added a `byte_offset: u64` field to both `AesEncryptor` and
+  `AesDecryptor`. Each call to `encrypt()`/`decrypt()` now advances the CTR
+  block counter by `byte_offset / 16` (Ctr128BE, big-endian, counter in
+  bytes 8–15 of the IV) so successive calls use non-overlapping keystream
+  segments. The same fix is applied to `AesDecryptor` proactively to support
+  future streaming decryption.
+
+  **Affected:** Any encrypted entry written with `write_data()` called more
+  than once per entry AND the total data written exceeds the flush threshold
+  (2MB for medium files, 4MB for large files). Single-call usage is unaffected.
+
+- **Fixed: Plaintext password leaked to stderr** (`src/encryption.rs`)
+
+  `AesEncryptor::new()` contained debug `eprintln!` statements that printed
+  the password, salt, and derived key material to stderr on every encryption
+  operation. These have been removed.
+
+### Tests ✅
+
+- `test_multi_chunk_encrypt_decrypt_roundtrip` — verifies correct decryption
+  of a 5MB entry written in two separate `encrypt()` calls (3MB + 2MB).
+- `test_ctr_keystreams_differ_across_chunks` — verifies that two identical
+  plaintext chunks encrypted at different offsets produce distinct ciphertext,
+  proving the keystream is not reused.
+- `test_single_chunk_still_works_after_offset_fix` — regression guard for
+  the common single-call path.
+
+## [0.11.0] - 2026-03-16
 
 ### Fixed 🐛
 

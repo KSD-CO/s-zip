@@ -51,9 +51,7 @@ let mut reader = StreamingZipReader::open("output.zip")?;
 let data = reader.read_entry_by_name("file.txt")?;
 ```
 
-### Async with Encryption (NEW in v0.11.0!)
-
-**Solves [Issue #1](https://github.com/KSD-CO/s-zip/issues/1)** - Full async encryption support:
+### Async with Encryption
 
 ```rust
 use s_zip::AsyncStreamingZipWriter;
@@ -90,6 +88,24 @@ let mut zip = AsyncStreamingZipWriter::from_writer(writer);
 zip.start_entry("data.json").await?;
 zip.write_data(br#"{"status": "ok"}"#).await?;
 zip.finish().await?;
+```
+
+## What's New in v0.11.1
+
+🔒 **Security patch** — fixes two critical vulnerabilities in the encryption feature:
+
+- **AES-CTR keystream reuse fixed** — writing large files in multiple chunks previously
+  reused the same keystream (IV=0 on every `encrypt()` call), allowing an attacker to
+  recover `p1 XOR p2` from two ciphertexts. Now `AesEncryptor` tracks a running
+  `byte_offset` so every chunk uses a distinct keystream segment.
+
+**Upgrade immediately if you use `encryption` feature with large files (>4MB per entry).**
+
+**Breaking Changes**: None.
+
+**Migration from v0.11.0**:
+```toml
+s-zip = { version = "0.11.1", features = ["async", "encryption"] }
 ```
 
 ## What's New in v0.11.0

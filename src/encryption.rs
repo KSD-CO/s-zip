@@ -64,6 +64,19 @@ impl AesStrength {
 }
 
 /// AES encryption context for a ZIP entry
+///
+/// Maintains a running byte offset so that AES-CTR keystream blocks are
+/// never reused across multiple `encrypt()` calls on the same entry.
+///
+/// CTR block counter layout (Ctr128BE, big-endian 128-bit counter):
+///
+///   encrypt(chunk1, len=N)            encrypt(chunk2, len=M)
+///        │                                   │
+///        ▼                                   ▼
+///   block_num = byte_offset / 16       block_num = (byte_offset+N) / 16
+///   IV[8..16] = block_num.to_be_bytes  IV[8..16] = block_num.to_be_bytes
+///   keystream: K[0..N]                 keystream: K[N..N+M]  ← no reuse
+///   byte_offset += N                   byte_offset += M
 pub struct AesEncryptor {
     strength: AesStrength,
     salt: Vec<u8>,
@@ -72,6 +85,9 @@ pub struct AesEncryptor {
     #[allow(dead_code)] // Used by HMAC, kept for future direct access
     auth_key: Vec<u8>,
     hmac: HmacSha1,
+    /// Running byte offset into the keystream; used to advance the CTR block
+    /// counter so successive encrypt() calls use non-overlapping keystream segments.
+    byte_offset: u64,
 }
 
 impl AesEncryptor {
@@ -86,24 +102,11 @@ impl AesEncryptor {
 
         pbkdf2_hmac::<Sha1>(password.as_bytes(), &salt, 1000, &mut derived_keys);
 
-        eprintln!("DEBUG AesEncryptor::new:");
-        eprintln!("  password: {}", password);
-        eprintln!("  salt: {:02x?}", salt);
-        eprintln!(
-            "  derived_keys (first 66 bytes): {:02x?}",
-            &derived_keys[..66.min(derived_keys.len())]
-        );
-
         // Split derived key material
         let key_size = strength.key_size();
         let encryption_key = derived_keys[..key_size].to_vec();
         let auth_key = derived_keys[key_size..key_size * 2].to_vec();
         let password_verify = [derived_keys[key_size * 2], derived_keys[key_size * 2 + 1]];
-
-        eprintln!(
-            "  password_verify: {:02x}{:02x}",
-            password_verify[0], password_verify[1]
-        );
 
         // Initialize HMAC for authentication
         let hmac = HmacSha1::new_from_slice(&auth_key)
@@ -116,6 +119,7 @@ impl AesEncryptor {
             encryption_key,
             auth_key,
             hmac,
+            byte_offset: 0,
         })
     }
 
@@ -139,16 +143,33 @@ impl AesEncryptor {
         self.hmac.update(data);
     }
 
-    /// Encrypt data in-place using AES-256-CTR (call AFTER compression)
+    /// Encrypt data in-place using AES-256-CTR (call AFTER compression).
+    ///
+    /// The CTR block counter advances by `data.len()` bytes on each call so
+    /// that successive calls on the same entry never reuse keystream blocks.
     pub fn encrypt(&mut self, data: &mut [u8]) -> Result<()> {
-        // Create AES-CTR cipher
+        // Compute the starting CTR block number from the running byte offset.
+        // Ctr128BE uses a 128-bit big-endian block counter; we store the
+        // counter in the upper 64 bits of the IV (bytes 8..16), leaving
+        // bytes 0..8 as zero (WinZip AE-2 nonce is all-zero).
+        let block_number = self.byte_offset / 16;
+        let mut iv = [0u8; 16];
+        iv[8..16].copy_from_slice(&block_number.to_be_bytes());
+
         let key = self.encryption_key.as_slice();
-        let iv = vec![0u8; 16]; // Counter mode IV (starts at 0)
+        let mut cipher = Ctr128BE::<Aes256>::new(key.into(), &iv.into());
 
-        let mut cipher = Ctr128BE::<Aes256>::new(key.into(), iv.as_slice().into());
+        // If byte_offset is not block-aligned, fast-forward the cipher by
+        // the partial block so the keystream is exactly byte-aligned.
+        let partial = (self.byte_offset % 16) as usize;
+        if partial != 0 {
+            let mut discard = vec![0u8; partial];
+            cipher.apply_keystream(&mut discard);
+        }
 
-        // Encrypt in-place
+        // Encrypt in-place and advance the running byte offset.
         cipher.apply_keystream(data);
+        self.byte_offset += data.len() as u64;
 
         Ok(())
     }
@@ -162,6 +183,10 @@ impl AesEncryptor {
 }
 
 /// AES decryption context for a ZIP entry
+///
+/// Mirrors `AesEncryptor`: maintains a `byte_offset` so that `decrypt()` can
+/// be called multiple times on the same entry (e.g., streaming decrypt in a
+/// future implementation) without reusing CTR keystream blocks.
 pub struct AesDecryptor {
     #[allow(dead_code)] // Kept for future API extensions
     strength: AesStrength,
@@ -171,6 +196,9 @@ pub struct AesDecryptor {
     #[allow(dead_code)] // Used for password validation, kept for debugging
     password_verify: [u8; 2],
     hmac: HmacSha1,
+    /// Running byte offset into the keystream; mirrors AesEncryptor so that
+    /// streaming decryption [P2-3] can reuse this struct without modification.
+    byte_offset: u64,
 }
 
 impl AesDecryptor {
@@ -217,19 +245,30 @@ impl AesDecryptor {
             auth_key,
             password_verify: *password_verify,
             hmac,
+            byte_offset: 0,
         })
     }
 
-    /// Decrypt data in-place using AES-256-CTR (call on compressed encrypted data)
+    /// Decrypt data in-place using AES-256-CTR (call on compressed encrypted data).
+    ///
+    /// Uses the same CTR block-counter advance logic as `AesEncryptor::encrypt()`
+    /// so that successive calls on the same entry remain byte-aligned.
     pub fn decrypt(&mut self, data: &mut [u8]) -> Result<()> {
-        // Create AES-CTR cipher
+        let block_number = self.byte_offset / 16;
+        let mut iv = [0u8; 16];
+        iv[8..16].copy_from_slice(&block_number.to_be_bytes());
+
         let key = self.encryption_key.as_slice();
-        let iv = vec![0u8; 16]; // Counter mode IV (starts at 0)
+        let mut cipher = Ctr128BE::<Aes256>::new(key.into(), &iv.into());
 
-        let mut cipher = Ctr128BE::<Aes256>::new(key.into(), iv.as_slice().into());
+        let partial = (self.byte_offset % 16) as usize;
+        if partial != 0 {
+            let mut discard = vec![0u8; partial];
+            cipher.apply_keystream(&mut discard);
+        }
 
-        // Decrypt in-place
         cipher.apply_keystream(data);
+        self.byte_offset += data.len() as u64;
 
         Ok(())
     }
@@ -348,5 +387,105 @@ mod tests {
         let result =
             AesDecryptor::new(wrong_password, AesStrength::Aes256, &salt, &password_verify);
         assert!(result.is_err(), "Expected password verification to fail");
+    }
+
+    /// T1: Multi-chunk encrypt/decrypt round-trip.
+    ///
+    /// Simulates writing a large entry in two separate write_data() calls —
+    /// the second call lands in a different CTR keystream block than the first.
+    /// If byte_offset is not advanced correctly, decryption will produce garbage.
+    ///
+    ///   chunk1 (3MB) ──encrypt──▶ ciphertext1  ──decrypt──▶ plaintext1 ✓
+    ///   chunk2 (2MB) ──encrypt──▶ ciphertext2  ──decrypt──▶ plaintext2 ✓
+    ///                 (byte_offset=3MB)          (byte_offset=3MB)
+    #[test]
+    fn test_multi_chunk_encrypt_decrypt_roundtrip() {
+        let password = "multi_chunk_password";
+        let chunk1 = vec![0xAAu8; 3 * 1024 * 1024]; // 3MB
+        let chunk2 = vec![0xBBu8; 2 * 1024 * 1024]; // 2MB
+
+        let mut encryptor = AesEncryptor::new(password, AesStrength::Aes256).unwrap();
+        let salt = encryptor.salt().to_vec();
+        let password_verify = *encryptor.password_verify();
+
+        // Encrypt chunk1 then chunk2 (simulating two write_data() calls with buffer flush)
+        let mut enc1 = chunk1.clone();
+        encryptor.encrypt(&mut enc1).unwrap();
+
+        let mut enc2 = chunk2.clone();
+        encryptor.encrypt(&mut enc2).unwrap();
+
+        let auth_code = encryptor.finalize();
+
+        // Encrypted chunks must differ from plaintext
+        assert_ne!(enc1, chunk1, "chunk1 should be encrypted");
+        assert_ne!(enc2, chunk2, "chunk2 should be encrypted");
+
+        // Decryptor must advance its counter by chunk1.len() between calls
+        let mut decryptor =
+            AesDecryptor::new(password, AesStrength::Aes256, &salt, &password_verify).unwrap();
+
+        decryptor.decrypt(&mut enc1).unwrap();
+        decryptor.decrypt(&mut enc2).unwrap();
+        decryptor.verify_auth_code(&auth_code).unwrap();
+
+        assert_eq!(enc1, chunk1, "chunk1 decryption mismatch");
+        assert_eq!(enc2, chunk2, "chunk2 decryption mismatch");
+    }
+
+    /// T2: CTR keystreams must differ across chunks.
+    ///
+    /// Encrypting two identical plaintext chunks with the same encryptor must
+    /// produce different ciphertext — proof that the keystream is not reused.
+    ///
+    ///   chunk1 = [0xCC; N]  ──encrypt──▶ c1  (keystream from offset 0)
+    ///   chunk2 = [0xCC; N]  ──encrypt──▶ c2  (keystream from offset N)
+    ///   c1 != c2  ✓  (different keystream blocks)
+    #[test]
+    fn test_ctr_keystreams_differ_across_chunks() {
+        let password = "keystream_test_password";
+        let plaintext_block = vec![0xCCu8; 1024]; // 1KB of identical bytes
+
+        let mut encryptor = AesEncryptor::new(password, AesStrength::Aes256).unwrap();
+
+        let mut c1 = plaintext_block.clone();
+        encryptor.encrypt(&mut c1).unwrap();
+
+        let mut c2 = plaintext_block.clone();
+        encryptor.encrypt(&mut c2).unwrap();
+
+        // Same plaintext encrypted at different offsets must yield different ciphertext
+        assert_ne!(c1, c2, "CTR keystream must not repeat across calls");
+
+        // Also verify neither equals the plaintext
+        assert_ne!(c1, plaintext_block);
+        assert_ne!(c2, plaintext_block);
+    }
+
+    /// T3: Single-chunk behavior is unchanged (regression guard).
+    ///
+    /// Ensures that the byte_offset fix does not break the existing single-call
+    /// encrypt/decrypt path used by all current entries.
+    #[test]
+    fn test_single_chunk_still_works_after_offset_fix() {
+        let password = "single_chunk_regression";
+        let plaintext = b"The quick brown fox jumps over the lazy dog.".to_vec();
+
+        let mut encryptor = AesEncryptor::new(password, AesStrength::Aes256).unwrap();
+        let salt = encryptor.salt().to_vec();
+        let password_verify = *encryptor.password_verify();
+
+        let mut ciphertext = plaintext.clone();
+        encryptor.encrypt(&mut ciphertext).unwrap();
+        let auth_code = encryptor.finalize();
+
+        assert_ne!(ciphertext, plaintext);
+
+        let mut decryptor =
+            AesDecryptor::new(password, AesStrength::Aes256, &salt, &password_verify).unwrap();
+        decryptor.decrypt(&mut ciphertext).unwrap();
+        decryptor.verify_auth_code(&auth_code).unwrap();
+
+        assert_eq!(ciphertext, plaintext);
     }
 }
