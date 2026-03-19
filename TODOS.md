@@ -17,57 +17,35 @@ detail to pick up without re-reading the full review.
 
 ---
 
-## P1 — Correctness & Reliability
+## P1 — Correctness & Reliability ✅ COMPLETED
 
-### [P1-1] Return SZipError::IncorrectPassword from AesDecryptor::new()
-**File:** `src/encryption.rs:207`
-**What:** Change `SZipError::InvalidFormat("Incorrect password")` to `SZipError::IncorrectPassword`.
-**Why:** Users can't pattern-match on wrong-password errors reliably. The purpose-built variant exists but isn't used.
-**Effort:** XS
-**Priority:** P1
+### [P1-1] ✅ Return SZipError::IncorrectPassword from AesDecryptor::new()
+**Resolved in:** v0.11.2
+**What was done:** Changed `AesDecryptor::new()` to return `SZipError::IncorrectPassword` instead of `SZipError::InvalidFormat("Incorrect password")`.
 
-### [P1-2] Change generate_salt() to return Result<Vec<u8>>
-**File:** `src/encryption.rs:258-293`
-**What:** Return `Result<Vec<u8>>` from `generate_salt()`. Propagate `getrandom` errors through `AesEncryptor::new()` as `SZipError::EncryptionError`. Remove `.expect()`.
-**Why:** Libraries must never panic in production paths. `.expect()` on `getrandom` will crash the process on any OS-level RNG failure.
-**Effort:** S
-**Priority:** P1
+### [P1-2] ✅ Change generate_salt() to return Result<Vec<u8>>
+**Resolved in:** v0.11.2
+**What was done:** `generate_salt()` now returns `Result<Vec<u8>>`. `getrandom` failure maps to `SZipError::EncryptionError`. `.expect()` panic removed. `AesEncryptor::new()` propagates with `?`.
 
-### [P1-3] Add size cap to prevent OOM on malicious compressed_size
-**File:** `src/reader.rs:191`, `src/async_reader.rs:144`
-**What:** Add a sanity check: if `entry.compressed_size > MAX_SAFE_ALLOC` (e.g., 2GB), return `SZipError::InvalidFormat("Entry too large")` instead of allocating.
-**Why:** A corrupt or malicious ZIP can set `compressed_size = u64::MAX`, causing `vec![0u8; u64::MAX as usize]` which immediately OOMs the process.
-**Effort:** XS
-**Priority:** P1
+### [P1-3] ✅ Add size cap to prevent OOM on malicious compressed_size
+**Resolved in:** v0.11.2
+**What was done:** Added `MAX_ENTRY_ALLOC = 2 GiB` constant to both `reader.rs` and `async_reader.rs`. Guard before `vec![0u8; data_size as usize]` returns `InvalidFormat` with message directing to `read_entry_streaming()`.
 
-### [P1-4] Return explicit error for encrypted entries in read_entry_streaming()
-**File:** `src/reader.rs:282`, `src/async_reader.rs:203`
-**What:** Check `entry.is_encrypted` (sync reader) or detect encryption flag (async reader) at the start of `read_entry_streaming()`. Return `SZipError::EncryptionError("Streaming read not supported for encrypted entries; use read_entry() instead")`.
-**Why:** Currently returns garbled decrypted data silently. This is a correctness bug.
-**Effort:** S
-**Priority:** P1
-**Note:** See TODO [P2-3] for actually implementing encryption in streaming read.
+### [P1-4] ✅ Return explicit error for encrypted entries in read_entry_streaming()
+**Resolved in:** v0.11.2
+**What was done:** Sync reader checks `entry.is_encrypted` (feature-gated) and returns `SZipError::EncryptionError`. `async_reader::ZipEntry` gained `is_encrypted: bool` field; central dir parser now reads flags u16 instead of skipping. Async streaming also guards with `#[cfg(feature = "encryption")]`.
 
-### [P1-5] Change ParallelConfig::with_max_concurrent() panics to Result
-**File:** `src/parallel.rs:61-66`
-**What:** Replace `assert!(max > 0, ...)` and `assert!(max <= 16, ...)` with returning `SZipError` or clamping the value.
-**Why:** Libraries must not panic on invalid user input. Panics propagate through the caller's code uncatchably.
-**Effort:** XS
-**Priority:** P1
+### [P1-5] ✅ Change ParallelConfig::with_max_concurrent() panics to Result
+**Resolved in:** v0.11.2
+**What was done:** `with_max_concurrent()` returns `Result<Self>` instead of `assert!` panic. Tests updated from `#[should_panic]` to `is_err()`. Example callsites updated with `.unwrap()`. **Breaking change** (noted in CHANGELOG/README).
 
-### [P1-6] Add ZipEntry::safe_path() for path traversal protection
-**File:** `src/reader.rs` (ZipEntry struct)
-**What:** Add `pub fn safe_path(&self) -> PathBuf` that strips leading `/`, `\`, and any `..` path components from the entry name.
-**Why:** Entry names like `../../../etc/passwd` enable directory traversal when users extract to disk using entry names directly. This is a well-known ZIP vulnerability (zip slip).
-**Effort:** S
-**Priority:** P1
+### [P1-6] ✅ Add ZipEntry::safe_path() for path traversal protection
+**Resolved in:** v0.11.2
+**What was done:** Added `pub fn safe_path(&self) -> PathBuf` to both `reader::ZipEntry` and `async_reader::ZipEntry`. Uses `Path::components().filter(Component::Normal)` to strip `..`, leading `/`/`\`, and Windows drive prefixes.
 
-### [P1-7] Fix write_entries_parallel() to use ZIP64 for entries >4GB
-**File:** `src/async_writer.rs:733`
-**What:** `entry.data.len() as u32` silently truncates for entries >4GB. Apply the same ZIP64 logic used in the sequential path.
-**Why:** Silent data corruption for large parallel entries.
-**Effort:** S
-**Priority:** P1
+### [P1-7] ✅ Fix write_entries_parallel() to use ZIP64 for entries >4GB
+**Resolved in:** v0.11.2
+**What was done:** `write_entries_parallel()` now detects when `compressed_size > u32::MAX || uncompressed_size > u32::MAX` and writes ZIP64 local headers (`version_needed=45`, `0xFFFFFFFF` placeholders, extra field ID `0x0001` with 64-bit sizes).
 
 ---
 
