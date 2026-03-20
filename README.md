@@ -24,15 +24,16 @@ High-performance streaming ZIP library for Rust backends. Process multi-gigabyte
 - 💪 **Parallel Compression** - 2-4x speedup on multi-core CPUs
 - 📦 **ZIP64** - Files >4GB supported
 - 🗜️ **Multiple Codecs** - DEFLATE, Zstd (3x faster compression)
+- 🔌 **Seekless Streaming** - Stream ZIPs to HTTP responses, pipes, any `AsyncWrite` (no `Seek` needed)
 
 ## Quick Start
 
 ```toml
 [dependencies]
-s-zip = "0.11"
+s-zip = "0.12"
 
 # With all features
-s-zip = { version = "0.11", features = ["async", "encryption", "async-zstd", "cloud-all"] }
+s-zip = { version = "0.12", features = ["async", "encryption", "async-zstd", "cloud-all"] }
 ```
 
 ### Basic Usage
@@ -90,32 +91,34 @@ zip.write_data(br#"{"status": "ok"}"#).await?;
 zip.finish().await?;
 ```
 
-## What's New in v0.11.3
+## What's New in v0.12.0
 
-⚡ **Performance & DRY refactor** — zero-copy parallel compression, streaming decrypt, proptest coverage:
+**P3 feature release** — seekless streaming, AES-128/192, parallel extraction, stats API, and convenience methods:
 
-- **True zero-copy parallel compression** — `compress_file_deflate` in `parallel.rs` previously
-  buffered the entire file into RAM before compressing. New `CrcReader` wrapper computes CRC32
-  on-the-fly through a `File → BufReader(64KB) → CrcReader → DeflateEncoder` pipeline.
-  Peak RAM per task is now **~96 KB regardless of file size** (was full file size × concurrency).
-  Measured: 20 files × 5MB with 8 threads → **~16 MB peak** (was ~320 MB).
+- **`SeeklessZipWriter`** — stream ZIPs to HTTP response bodies, pipes, or any `AsyncWrite` without `Seek`.
+  Pre-compresses each entry; peak RAM ≈ compressed entry size (negligible for compressible data).
 
-- **Streaming decryption** — `read_entry_streaming()` on both sync and async readers now supports
-  encrypted entries via new `DecryptingReader<R>` / `AsyncDecryptingReader<R>` wrappers.
-  Call `.finish()` after reading to verify the HMAC-SHA1 tag.
+- **`read_entries_parallel()`** on `AsyncStreamingZipReader` — extract multiple named entries concurrently
+  with a bounded semaphore. Missing names are silently skipped.
 
-- **Shared `format.rs` module** — ZIP constants, `ZipEntry`, and pure parsing helpers extracted
-  from duplicated `reader.rs`/`async_reader.rs`. ~300 lines of duplicate code removed.
+- **AES-128 / AES-192** — `AesStrength::Aes128` and `AesStrength::Aes192` now fully functional
+  alongside the existing `Aes256`.
 
-- **Proptest fuzz coverage** — 6 property tests in `tests/proptest_zip_parsing.rs` verify
-  `find_eocd_in_buffer`, `find_zip64_eocd_offset`, and `parse_zip64_extra_field` never panic
-  on arbitrary input.
+- **`finish_with_stats()`** — returns `ZipStats` (entry count, compressed/uncompressed bytes,
+  compression ratio, encrypted flag) as a non-breaking additive method on both sync and async writers.
+
+- **`add_entry()`** one-liner — `writer.add_entry("name", data)?` on all three writer types.
+
+- **`entry_count()` / `bytes_written()`** accessors on all writer types for progress reporting.
+
+- **`estimated_peak_memory_mb()` fix** — updated from stale `4 MB/task` to accurate `1 MB/task`
+  after the v0.11.3 `CrcReader` streaming pipeline. Measured: **4.6 MB peak** for 8 threads × 5 MB files.
 
 **Breaking Changes**: None.
 
-**Migration from v0.11.2**:
+**Migration from v0.11.x**:
 ```toml
-s-zip = { version = "0.11.3", features = ["async", "encryption"] }
+s-zip = { version = "0.12", features = ["async", "encryption"] }
 ```
 
 
@@ -206,6 +209,25 @@ writer.write_data(b"In-memory content")?;
 let cursor = writer.finish()?;
 let zip_bytes = cursor.into_inner();
 ```
+
+**Seekless Streaming** (HTTP responses, pipes — no `Seek` required):
+```rust
+use s_zip::SeeklessZipWriter;
+
+// Stream ZIP directly to an Axum/Actix response body or any AsyncWrite
+let mut body = Vec::new(); // replace with response body writer
+let mut writer = SeeklessZipWriter::new(&mut body);
+writer.add_entry("report.csv", csv_bytes).await?;
+writer.add_entry("data.json", json_bytes).await?;
+writer.finish().await?;
+// body now contains a valid ZIP archive
+```
+
+> **Memory note**: `SeeklessZipWriter` pre-compresses each entry into a `Vec<u8>` before
+> writing the local header (sizes must be known upfront without `Seek`). Peak RAM per
+> `add_entry()` call is proportional to the **compressed** entry size — negligible for
+> compressible data, up to ~1× entry size for incompressible data. Entries are flushed
+> to the sink immediately; the writer does not buffer the entire archive.
 
 More examples in [examples/](examples/) directory.
 

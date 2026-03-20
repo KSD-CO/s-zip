@@ -14,7 +14,7 @@
 //! - Password verification before decryption
 
 use crate::error::{Result, SZipError};
-use aes::Aes256;
+use aes::{Aes128, Aes192, Aes256};
 use ctr::{
     cipher::{KeyIvInit, StreamCipher},
     Ctr128BE,
@@ -27,11 +27,16 @@ type HmacSha1 = Hmac<Sha1>;
 
 /// AES encryption strength
 ///
-/// Currently only AES-256 is supported as it provides the best security.
-/// Future versions may support AES-128 and AES-192.
+/// Specifies the AES key length used for ZIP entry encryption.
+/// AES-256 is recommended for maximum security; AES-128 and AES-192 are
+/// provided for compatibility with archives created by older tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AesStrength {
-    /// AES-256 (recommended and only supported variant)
+    /// AES-128 (16-byte key, 8-byte salt). WinZip strength code 0x01.
+    Aes128,
+    /// AES-192 (24-byte key, 12-byte salt). WinZip strength code 0x02.
+    Aes192,
+    /// AES-256 (32-byte key, 16-byte salt). WinZip strength code 0x03. Recommended.
     Aes256,
 }
 
@@ -39,6 +44,8 @@ impl AesStrength {
     /// Get salt size in bytes
     pub fn salt_size(&self) -> usize {
         match self {
+            AesStrength::Aes128 => 8,
+            AesStrength::Aes192 => 12,
             AesStrength::Aes256 => 16,
         }
     }
@@ -46,18 +53,22 @@ impl AesStrength {
     /// Get key size in bytes
     pub fn key_size(&self) -> usize {
         match self {
+            AesStrength::Aes128 => 16,
+            AesStrength::Aes192 => 24,
             AesStrength::Aes256 => 32,
         }
     }
 
-    /// Get total derived key material size (key + IV + password verification)
+    /// Get total derived key material size (key + auth_key + password verification)
     pub fn derived_key_size(&self) -> usize {
-        self.key_size() * 2 + 2 // key + IV + 2-byte password verification
+        self.key_size() * 2 + 2
     }
 
     /// Get WinZip encryption strength code
     pub fn to_winzip_code(&self) -> u16 {
         match self {
+            AesStrength::Aes128 => 0x01,
+            AesStrength::Aes192 => 0x02,
             AesStrength::Aes256 => 0x03,
         }
     }
@@ -148,29 +159,8 @@ impl AesEncryptor {
     /// The CTR block counter advances by `data.len()` bytes on each call so
     /// that successive calls on the same entry never reuse keystream blocks.
     pub fn encrypt(&mut self, data: &mut [u8]) -> Result<()> {
-        // Compute the starting CTR block number from the running byte offset.
-        // Ctr128BE uses a 128-bit big-endian block counter; we store the
-        // counter in the upper 64 bits of the IV (bytes 8..16), leaving
-        // bytes 0..8 as zero (WinZip AE-2 nonce is all-zero).
-        let block_number = self.byte_offset / 16;
-        let mut iv = [0u8; 16];
-        iv[8..16].copy_from_slice(&block_number.to_be_bytes());
-
-        let key = self.encryption_key.as_slice();
-        let mut cipher = Ctr128BE::<Aes256>::new(key.into(), &iv.into());
-
-        // If byte_offset is not block-aligned, fast-forward the cipher by
-        // the partial block so the keystream is exactly byte-aligned.
-        let partial = (self.byte_offset % 16) as usize;
-        if partial != 0 {
-            let mut discard = vec![0u8; partial];
-            cipher.apply_keystream(&mut discard);
-        }
-
-        // Encrypt in-place and advance the running byte offset.
-        cipher.apply_keystream(data);
+        apply_ctr_keystream(self.strength, &self.encryption_key, self.byte_offset, data);
         self.byte_offset += data.len() as u64;
-
         Ok(())
     }
 
@@ -249,27 +239,14 @@ impl AesDecryptor {
         })
     }
 
-    /// Decrypt data in-place using AES-256-CTR (call on compressed encrypted data).
+    /// Decrypt data in-place using AES-CTR (call on compressed encrypted data).
     ///
     /// Uses the same CTR block-counter advance logic as `AesEncryptor::encrypt()`
     /// so that successive calls on the same entry remain byte-aligned.
     pub fn decrypt(&mut self, data: &mut [u8]) -> Result<()> {
-        let block_number = self.byte_offset / 16;
-        let mut iv = [0u8; 16];
-        iv[8..16].copy_from_slice(&block_number.to_be_bytes());
-
-        let key = self.encryption_key.as_slice();
-        let mut cipher = Ctr128BE::<Aes256>::new(key.into(), &iv.into());
-
-        let partial = (self.byte_offset % 16) as usize;
-        if partial != 0 {
-            let mut discard = vec![0u8; partial];
-            cipher.apply_keystream(&mut discard);
-        }
-
-        cipher.apply_keystream(data);
+        // AES-CTR decryption is identical to encryption (XOR with keystream)
+        apply_ctr_keystream(self.strength, &self.encryption_key, self.byte_offset, data);
         self.byte_offset += data.len() as u64;
-
         Ok(())
     }
 
@@ -290,6 +267,43 @@ impl AesDecryptor {
         }
 
         Ok(())
+    }
+}
+
+/// Apply AES-CTR keystream to `data` in-place.
+///
+/// Dispatches to the correct AES variant based on `strength`.
+/// The CTR counter is set so that the keystream starts at `byte_offset`
+/// (not at the beginning of the stream), matching WinZip AE-2 behavior.
+///
+/// This function is shared between `AesEncryptor::encrypt()` and
+/// `AesDecryptor::decrypt()` — AES-CTR encryption and decryption are
+/// identical operations.
+fn apply_ctr_keystream(strength: AesStrength, key: &[u8], byte_offset: u64, data: &mut [u8]) {
+    // CTR block counter: stored in the upper 64 bits of the 128-bit IV.
+    let block_number = byte_offset / 16;
+    let mut iv = [0u8; 16];
+    iv[8..16].copy_from_slice(&block_number.to_be_bytes());
+
+    // Partial-block alignment: fast-forward past bytes already consumed
+    // within the current block.
+    let partial = (byte_offset % 16) as usize;
+
+    macro_rules! run_cipher {
+        ($Aes:ty) => {{
+            let mut cipher = Ctr128BE::<$Aes>::new(key.into(), &iv.into());
+            if partial != 0 {
+                let mut discard = vec![0u8; partial];
+                cipher.apply_keystream(&mut discard);
+            }
+            cipher.apply_keystream(data);
+        }};
+    }
+
+    match strength {
+        AesStrength::Aes128 => run_cipher!(Aes128),
+        AesStrength::Aes192 => run_cipher!(Aes192),
+        AesStrength::Aes256 => run_cipher!(Aes256),
     }
 }
 

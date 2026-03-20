@@ -702,6 +702,8 @@ impl StreamingZipReader {
         };
 
         let strength = match strength_code {
+            0x01 => AesStrength::Aes128,
+            0x02 => AesStrength::Aes192,
             0x03 => AesStrength::Aes256,
             _ => {
                 return Err(SZipError::InvalidFormat(format!(

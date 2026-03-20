@@ -65,14 +65,96 @@ impl AsyncStreamingZipReader {
         let file = File::open(path).await?;
         GenericAsyncZipReader::new_with_buffer_size(file, buffer_size).await
     }
+
+    /// Read multiple entries concurrently, each in its own file handle.
+    ///
+    /// Opens a new `File` handle per task (bounded by `max_concurrent`) so
+    /// that entries are decompressed in parallel without blocking each other.
+    /// Useful for extracting many entries from a large archive.
+    ///
+    /// # Arguments
+    /// * `path` — path to the ZIP file (re-opened per task)
+    /// * `names` — entry names to extract; missing entries are silently skipped
+    /// * `max_concurrent` — maximum parallel tasks (defaults to 4)
+    ///
+    /// # Returns
+    /// Vec of `(name, data)` pairs in the same order as `names` (skipping
+    /// any entries not found).
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::AsyncStreamingZipReader;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let results = AsyncStreamingZipReader::read_entries_parallel(
+    ///     "archive.zip",
+    ///     vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()],
+    ///     Some(4),
+    /// ).await?;
+    /// for (name, data) in &results {
+    ///     println!("{}: {} bytes", name, data.len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read_entries_parallel(
+        path: impl AsRef<std::path::Path>,
+        names: Vec<String>,
+        max_concurrent: Option<usize>,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        use std::sync::Arc;
+        use tokio::sync::{Semaphore, mpsc};
+
+        let path = Arc::new(path.as_ref().to_path_buf());
+        let concurrency = max_concurrent.unwrap_or(4).max(1);
+        let sem = Arc::new(Semaphore::new(concurrency));
+
+        // First open the file once to read the central directory
+        let index = AsyncStreamingZipReader::open(path.as_ref()).await?;
+        let entry_map: std::collections::HashMap<String, crate::format::ZipEntry> = index
+            .entries()
+            .iter()
+            .map(|e| (e.name.clone(), e.clone()))
+            .collect();
+
+        // Filter to only names that exist
+        let targets: Vec<(String, crate::format::ZipEntry)> = names
+            .into_iter()
+            .filter_map(|n| entry_map.get(&n).map(|e| (n.clone(), e.clone())))
+            .collect();
+
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (tx, mut rx) = mpsc::channel::<Result<(String, Vec<u8>)>>(targets.len());
+
+        for (name, entry) in targets {
+            let path = Arc::clone(&path);
+            let sem = Arc::clone(&sem);
+            let tx = tx.clone();
+
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                let result = async {
+                    let mut reader = AsyncStreamingZipReader::open(path.as_ref()).await?;
+                    let data = reader.read_entry(&entry).await?;
+                    Ok((name, data))
+                }
+                .await;
+                let _ = tx.send(result).await;
+            });
+        }
+        drop(tx); // close sender so receiver can drain
+
+        let mut results = Vec::new();
+        while let Some(r) = rx.recv().await {
+            results.push(r?);
+        }
+        Ok(results)
+    }
 }
 
 impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
-    /// Create a new generic async ZIP reader from any reader that supports AsyncRead + AsyncSeek
-    pub async fn new(reader: R) -> Result<Self> {
-        Self::new_with_buffer_size(reader, None).await
-    }
-
     /// Create a new generic async ZIP reader with custom buffer size
     ///
     /// Allows fine-tuning read performance based on expected data patterns.
@@ -719,6 +801,8 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         };
 
         let strength = match strength_code {
+            0x01 => AesStrength::Aes128,
+            0x02 => AesStrength::Aes192,
             0x03 => AesStrength::Aes256,
             _ => {
                 return Err(SZipError::InvalidFormat(format!(

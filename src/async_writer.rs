@@ -417,7 +417,40 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
 
     /// Start a new entry (file) in the ZIP
     pub async fn start_entry(&mut self, name: &str) -> Result<()> {
+        crate::trace!(entry = name, "start_entry");
         self.start_entry_with_hint(name, None).await
+    }
+
+    /// Write a complete entry in one call (convenience shorthand for
+    /// `start_entry` + `write_data`).
+    ///
+    /// ```no_run
+    /// # use s_zip::AsyncStreamingZipWriter;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut writer = AsyncStreamingZipWriter::new("out.zip").await?;
+    /// writer.add_entry("hello.txt", b"Hello, world!").await?;
+    /// writer.finish().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn add_entry(&mut self, name: &str, data: &[u8]) -> Result<()> {
+        self.start_entry(name).await?;
+        self.write_data(data).await
+    }
+
+    /// Number of entries fully written so far.
+    ///
+    /// Includes any in-progress entry (started but not yet followed by
+    /// another `start_entry` or `finish`).
+    pub fn entry_count(&self) -> usize {
+        self.entries.len() + if self.current_entry.is_some() { 1 } else { 0 }
+    }
+
+    /// Total uncompressed bytes written across all completed entries.
+    ///
+    /// Does **not** include bytes written to any in-progress entry.
+    pub fn bytes_written(&self) -> u64 {
+        self.entries.iter().map(|e| e.uncompressed_size).sum()
     }
 
     /// Start a new entry with size hint for optimized buffering
@@ -575,6 +608,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
 
     /// Write uncompressed data to current entry (will be compressed and/or encrypted on-the-fly)
     pub async fn write_data(&mut self, data: &[u8]) -> Result<()> {
+        crate::trace!(bytes = data.len(), "write_data");
         let entry = self
             .current_entry
             .as_mut()
@@ -826,6 +860,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
 
     /// Finish ZIP file (write central directory and return the writer)
     pub async fn finish(mut self) -> Result<W> {
+        crate::trace!(entries = self.entries.len(), "finish");
         // Finish last entry
         self.finish_current_entry().await?;
 
@@ -1017,5 +1052,54 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         self.output.shutdown().await?;
 
         Ok(self.output)
+    }
+
+    /// Finish the ZIP archive and return the underlying writer together with
+    /// a [`crate::ZipStats`] summary.
+    ///
+    /// Non-breaking alternative to [`finish`](Self::finish).
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::AsyncStreamingZipWriter;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut w = AsyncStreamingZipWriter::new("out.zip").await?;
+    /// w.add_entry("readme.txt", b"hello").await?;
+    /// let (_writer, stats) = w.finish_with_stats().await?;
+    /// println!("{} entries, ratio {:.2}", stats.entry_count, stats.compression_ratio);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn finish_with_stats(mut self) -> Result<(W, crate::ZipStats)> {
+        // Flush in-progress entry before collecting stats.
+        self.finish_current_entry().await?;
+
+        let total_uncompressed: u64 = self.entries.iter().map(|e| e.uncompressed_size).sum();
+        let total_compressed: u64 = self.entries.iter().map(|e| e.compressed_size).sum();
+        let entry_count = self.entries.len();
+        #[cfg(feature = "encryption")]
+        let encrypted = self.entries.iter().any(|e| e.encryption_strength.is_some());
+        #[cfg(not(feature = "encryption"))]
+        let encrypted = false;
+
+        let compression_ratio = if total_uncompressed == 0 {
+            1.0
+        } else {
+            total_compressed as f32 / total_uncompressed as f32
+        };
+
+        // finish() will call finish_current_entry() again but since
+        // current_entry is now None it's a no-op.
+        let writer = self.finish().await?;
+        Ok((
+            writer,
+            crate::ZipStats {
+                entry_count,
+                total_uncompressed_bytes: total_uncompressed,
+                total_compressed_bytes: total_compressed,
+                compression_ratio,
+                encrypted,
+            },
+        ))
     }
 }

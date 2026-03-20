@@ -5,6 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-03-20
+
+### Added ✨
+
+- **`SeeklessZipWriter`** (`src/seekless.rs`) — async ZIP writer for any `AsyncWrite + Unpin` sink.
+
+  Does not require `AsyncSeek`. Works with HTTP response bodies, pipes, `Vec<u8>`, network
+  sockets — any destination that cannot seek. Entries are pre-compressed in RAM so that
+  the local file header can include known sizes before the compressed data is written.
+
+  ```rust
+  use s_zip::SeeklessZipWriter;
+
+  let mut body = Vec::new();
+  let mut writer = SeeklessZipWriter::new(&mut body);
+  writer.add_entry("report.csv", csv_bytes).await?;
+  writer.add_entry("data.json", json_bytes).await?;
+  writer.finish().await?;
+  ```
+
+  Features: `add_entry()`, `add_entry_with_options()` (mtime + Unix mode), `with_compression()`,
+  `with_method()`, `entry_count()`, `bytes_written()`, full ZIP64 support.
+
+  **Memory tradeoff**: peak RAM per `add_entry()` call ≈ compressed entry size.
+  For compressible data this is negligible. For incompressible data it is ~1× entry size.
+  The writer does not buffer the full archive — entries are flushed to the sink immediately.
+
+- **`AesStrength::Aes128` and `AesStrength::Aes192`** (`src/encryption.rs`)
+
+  AES-128 (16-byte key, 8-byte salt, WinZip code `0x01`) and AES-192 (24-byte key,
+  12-byte salt, WinZip code `0x02`) now work in both `AesEncryptor` and `AesDecryptor`.
+  Previously only `Aes256` was functional despite all variants being declared.
+
+- **`ZipStats` and `finish_with_stats()`** (`src/lib.rs`, `src/writer.rs`, `src/async_writer.rs`)
+
+  New `pub struct ZipStats` with `entry_count`, `total_uncompressed_bytes`,
+  `total_compressed_bytes`, `compression_ratio: f32`, `encrypted: bool`, and helper
+  `bytes_saved() -> u64`. Added `finish_with_stats()` on both `StreamingZipWriter` and
+  `AsyncStreamingZipWriter` as a non-breaking additive method (existing `finish()` unchanged).
+
+- **`add_entry()` convenience method** on `StreamingZipWriter`, `AsyncStreamingZipWriter`, and `SeeklessZipWriter`
+
+  One-liner for the common `start_entry` + `write_data` pattern:
+  ```rust
+  writer.add_entry("readme.txt", b"Hello")?;
+  ```
+
+- **`entry_count()` and `bytes_written()` accessors** on all three writer types.
+
+  Useful for progress reporting without external tracking.
+
+- **`AsyncStreamingZipReader::read_entries_parallel()`** (`src/async_reader.rs`)
+
+  Extract multiple named entries concurrently with bounded semaphore concurrency:
+  ```rust
+  let results = AsyncStreamingZipReader::read_entries_parallel(
+      &path,
+      vec!["a.csv".to_string(), "b.csv".to_string()],
+      Some(4), // max concurrent
+  ).await?;
+  ```
+  Missing names are silently skipped. Default concurrency: 4.
+
+### Fixed 🐛
+
+- **`ParallelConfig::estimated_peak_memory_mb()` returned stale value** (`src/parallel.rs`)
+
+  After the v0.11.3 `CrcReader` streaming pipeline reduced per-task RAM from ~4 MB to
+  ~96 KB, `estimated_peak_memory_mb()` still used the old `max_concurrent × 4` formula.
+  Now returns `max_concurrent × 1` MB — a conservative bound measured at ~0.1–0.5 MB/task
+  in practice on compressible data.
+
+  Measured: 20 files × 5 MB, 8 threads → **4.6 MB peak** (formula now returns 8 MB; actual is lower).
+
 ## [0.11.3] - 2026-03-19
 
 ### Added ✨

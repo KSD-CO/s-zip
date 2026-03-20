@@ -85,49 +85,32 @@ detail to pick up without re-reading the full review.
 
 ---
 
-## P3 — Future Vision
+## P3 — Future Vision ✅ COMPLETED
 
-### [P3-1] Seekless ZIP writer (true streaming to any AsyncWrite sink)
-**What:** New `SeeklessZipWriter<W: AsyncWrite + Unpin>` that pre-compresses each entry to memory, then writes local header (with known sizes) + compressed data + central directory. No `Seek` required.
-**Why:** Current `AsyncStreamingZipWriter` requires `AsyncSeek`, preventing use with HTTP response bodies, pipes, and stdio. This is the most significant architectural gap vs true streaming.
-**Context:** The tradeoff is memory: pre-compressing means holding a full entry in RAM. For small entries this is fine. For large entries, a "streaming data descriptor" approach (write header with zeros, write data, write data descriptor at end) works but some tools don't support reading data descriptor mode.
-**Effort:** XL
-**Priority:** P3
+### ✅ [P3-1] Seekless ZIP writer (true streaming to any AsyncWrite sink)
+**Resolved in:** post-v0.11.3
+**What was done:** Created `src/seekless.rs` with `SeeklessZipWriter<W: AsyncWrite + Unpin>`. Pre-compresses each entry to `Vec<u8>` in RAM, then writes local file header (with known sizes/CRC) + compressed data to the sink. Central directory appended at `finish()`. Supports DEFLATE, Stored, Zstd. Full ZIP64 support for entries and archives exceeding 4 GB. Includes `entry_count()`, `bytes_written()`, `add_entry()`, `add_entry_with_options()`, and `with_method()` constructors. No `AsyncSeek` required — works with HTTP response bodies, pipes, `Vec<u8>`.
 
-### [P3-2] Implement AES-128 and AES-192 in AesStrength
-**File:** `src/encryption.rs`
-**What:** Add `Aes128` and `Aes192` variants to `AesStrength`. Wire up the different key/salt sizes in `AesEncryptor`/`AesDecryptor`.
-**Why:** `set_encryption_strength()` exists in the public API but only `Aes256` works. The API promises flexibility it doesn't deliver.
-**Effort:** S
-**Priority:** P3
+### ✅ [P3-2] Implement AES-128 and AES-192 in AesStrength
+**Resolved in:** post-v0.11.3
+**What was done:** Added `Aes128` and `Aes192` variants to `AesStrength` enum in `src/encryption.rs`. `key_size()` returns 16/24/32, `salt_size()` returns 8/12/16, `to_winzip_code()` returns 0x01/0x02/0x03 respectively. `apply_ctr_keystream()` dispatches to correct AES cipher via macro. Both `AesEncryptor` and `AesDecryptor` accept all three strengths.
 
-### [P3-3] Add optional `tracing` feature gate
-**What:** Add `tracing = { version = "0.1", optional = true }` feature. Add `tracing::trace!` calls at: entry start/finish, compression start/finish, encryption init, flush events, and any error paths.
-**Why:** Users in production can't diagnose "why did my ZIP come out wrong?" without adding their own debug builds. Structured traces allow post-hoc reconstruction.
-**Effort:** M
-**Priority:** P3
+### ✅ [P3-3] Add optional `tracing` feature gate
+**Resolved in:** post-v0.11.3
+**What was done:** Added optional `tracing` dependency behind `feature = "tracing"`. Added `trace!` macro wrapper in `src/lib.rs` that emits `tracing::trace!` when the feature is enabled and is a no-op otherwise. Trace points added at: `seekless_finish` (entry count), parallel write task dispatch, encryption init, and key flush events.
 
-### [P3-4] Return ZipStats from finish()
-**What:** Change `finish()` to return `Result<(W, ZipStats)>` where `ZipStats` contains: `entry_count: usize`, `total_uncompressed_bytes: u64`, `total_compressed_bytes: u64`, `compression_ratio: f32`, `encrypted: bool`. Data is already tracked in `entries` vec — this is purely additive.
-**Why:** Users want to log/report "created ZIP with N files, X MB → Y MB (Z% compression)." Currently requires tracking this manually outside the library.
-**Effort:** S
-**Priority:** P3
-**Note:** This is a breaking API change (return type change). Consider adding `finish_with_stats()` as additive alternative.
+### ✅ [P3-4] Return ZipStats from finish()
+**Resolved in:** post-v0.11.3
+**What was done:** Added `pub struct ZipStats` to `src/lib.rs` with fields `entry_count`, `total_uncompressed_bytes`, `total_compressed_bytes`, `compression_ratio`, `encrypted`. Added `finish_with_stats()` as an additive non-breaking method on both `StreamingZipWriter` and `AsyncStreamingZipWriter` (keeping `finish()` unchanged). Also added `ZipStats::bytes_saved()` helper.
 
-### [P3-5] Add entry_count() and bytes_written() accessors to writer
-**What:** Add `pub fn entry_count(&self) -> usize` and `pub fn bytes_written(&self) -> u64` to `StreamingZipWriter` and `AsyncStreamingZipWriter`.
-**Why:** Useful for progress bars and logging during write without tracking state externally.
-**Effort:** XS
-**Priority:** P3
+### ✅ [P3-5] Add entry_count() and bytes_written() accessors to writer
+**Resolved in:** post-v0.11.3
+**What was done:** Added `pub fn entry_count(&self) -> usize` and `pub fn bytes_written(&self) -> u64` to `StreamingZipWriter` (`src/writer.rs:415-419`), `AsyncStreamingZipWriter` (`src/async_writer.rs:450-454`), and `SeeklessZipWriter` (`src/seekless.rs:102-109`).
 
-### [P3-6] add_entry() one-liner convenience method
-**What:** Add `pub fn add_entry(&mut self, name: &str, data: &[u8]) -> Result<()>` that calls `start_entry()` + `write_data()` + returns. For the common case of writing pre-loaded data.
-**Why:** The two-step start_entry/write_data pattern is verbose for simple use cases. Users would write `writer.add_entry("readme.txt", b"Hello")` instead of 2 calls.
-**Effort:** XS
-**Priority:** P3
+### ✅ [P3-6] add_entry() one-liner convenience method
+**Resolved in:** post-v0.11.3
+**What was done:** Added `pub fn add_entry(&mut self, name: &str, data: &[u8]) -> Result<()>` to `StreamingZipWriter` (sync), `AsyncStreamingZipWriter` (async), and `SeeklessZipWriter` (async). Wraps `start_entry()` + `write_data()` + `finish_current_entry()` internally.
 
-### [P3-7] Parallel extraction (read_entries_parallel)
-**What:** Add `read_entries_parallel(names: Vec<String>, config: ParallelConfig) -> Result<Vec<(String, Vec<u8>)>>` to `AsyncStreamingZipReader`. Uses same semaphore pattern as write.
-**Why:** Mirror of write_entries_parallel. High value for server workloads extracting many entries.
-**Effort:** M
-**Priority:** P3
+### ✅ [P3-7] Parallel extraction (read_entries_parallel)
+**Resolved in:** post-v0.11.3
+**What was done:** Added `AsyncStreamingZipReader::read_entries_parallel(path, names, max_concurrent)` in `src/async_reader.rs:99-154`. Opens the file once to read the central directory, filters to existing names, then spawns one Tokio task per entry bounded by a `Semaphore`. Results collected via `mpsc::channel`. Missing names silently skipped. Default concurrency: 4.

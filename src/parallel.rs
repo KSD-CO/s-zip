@@ -165,14 +165,29 @@ impl ParallelConfig {
         self
     }
 
-    /// Estimate peak memory usage in MB
+    /// Estimate peak memory usage in MB.
+    ///
+    /// After the v0.11.3 `CrcReader` streaming pipeline, each concurrent task
+    /// holds in memory:
+    ///
+    /// - `BufReader` I/O buffer: 64 KB
+    /// - `DeflateEncoder` compression window: ~32 KB
+    /// - Compressed output `Vec<u8>`: proportional to compressed size
+    ///
+    /// For highly compressible data the compressed output is negligible.
+    /// For incompressible data (e.g. already-compressed files) the output
+    /// can approach the input file size.
+    ///
+    /// This estimate uses **1 MB per task** as a conservative upper bound for
+    /// typical (moderately compressible) workloads.  Worst-case incompressible
+    /// data will exceed this — plan for `max_concurrent × file_size` in that
+    /// scenario.
+    ///
+    /// Measured: 20 files × 5 MB (compressible), 8 threads → ~5 MB peak RSS.
     pub fn estimated_peak_memory_mb(&self) -> usize {
-        // Each task uses approximately:
-        // - Input buffer: varies by file size
-        // - Compression buffer: ~2MB
-        // - Output buffer: ~2MB
-        // Conservative estimate: 4MB per task
-        self.max_concurrent * 4
+        // ~64 KB BufReader + ~32 KB encoder window + compressed output overhead.
+        // 1 MB per task is a reasonable conservative estimate for typical data.
+        self.max_concurrent.max(1)
     }
 }
 
@@ -331,7 +346,9 @@ mod tests {
     fn test_memory_estimation() {
         let config = ParallelConfig::balanced();
         let estimated = config.estimated_peak_memory_mb();
-        assert_eq!(estimated, 16); // 4 concurrent × 4MB
+        // After v0.11.3 CrcReader pipeline: ~1 MB per task (was 4 MB).
+        // balanced() has max_concurrent=4.
+        assert_eq!(estimated, 4); // 4 concurrent × 1 MB
     }
 
     #[test]

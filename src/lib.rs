@@ -81,6 +81,18 @@ pub mod encryption;
 #[cfg(feature = "encryption")]
 pub mod decrypt_reader;
 
+/// Emit a `tracing::trace!` event when the `tracing` feature is enabled.
+/// Expands to nothing when the feature is off, with zero runtime cost.
+#[cfg(feature = "tracing")]
+macro_rules! trace {
+    ($($arg:tt)*) => { ::tracing::trace!($($arg)*) };
+}
+#[cfg(not(feature = "tracing"))]
+macro_rules! trace {
+    ($($arg:tt)*) => {};
+}
+pub(crate) use trace;
+
 #[cfg(feature = "async")]
 pub mod async_writer;
 
@@ -89,6 +101,9 @@ pub mod async_reader;
 
 #[cfg(feature = "async")]
 pub mod parallel;
+
+#[cfg(feature = "async")]
+pub mod seekless;
 
 #[cfg(any(feature = "cloud-s3", feature = "cloud-gcs"))]
 pub mod cloud;
@@ -220,8 +235,56 @@ impl EntryOptions {
     }
 }
 
+/// Statistics returned by `finish_with_stats()`.
+///
+/// Provides a summary of the ZIP archive created, useful for logging,
+/// progress reporting, and monitoring.
+///
+/// # Example
+/// ```no_run
+/// # use s_zip::StreamingZipWriter;
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut writer = StreamingZipWriter::new("out.zip")?;
+/// writer.add_entry("data.txt", b"hello")?;
+/// let (_writer, stats) = writer.finish_with_stats()?;
+/// println!(
+///     "{} entries, {:.1} KB → {:.1} KB ({:.0}% saved)",
+///     stats.entry_count,
+///     stats.total_uncompressed_bytes as f64 / 1024.0,
+///     stats.total_compressed_bytes as f64 / 1024.0,
+///     (1.0 - stats.compression_ratio) * 100.0,
+/// );
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ZipStats {
+    /// Number of entries written.
+    pub entry_count: usize,
+    /// Sum of all uncompressed entry sizes in bytes.
+    pub total_uncompressed_bytes: u64,
+    /// Sum of all compressed entry sizes in bytes (excluding ZIP overhead).
+    pub total_compressed_bytes: u64,
+    /// `total_compressed_bytes / total_uncompressed_bytes`, or `1.0` if no
+    /// data was written.  Values < 1.0 indicate compression; 1.0 means
+    /// stored (no compression or incompressible data).
+    pub compression_ratio: f32,
+    /// `true` if any entry was encrypted.
+    pub encrypted: bool,
+}
+
+impl ZipStats {
+    /// Bytes saved by compression (`total_uncompressed_bytes - total_compressed_bytes`).
+    pub fn bytes_saved(&self) -> u64 {
+        self.total_uncompressed_bytes
+            .saturating_sub(self.total_compressed_bytes)
+    }
+}
+
 #[cfg(feature = "async")]
 pub use async_writer::AsyncStreamingZipWriter;
+#[cfg(feature = "async")]
+pub use seekless::SeeklessZipWriter;
 #[cfg(feature = "encryption")]
 pub use encryption::AesStrength;
 
