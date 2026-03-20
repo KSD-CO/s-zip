@@ -5,7 +5,9 @@
 //! - finish_with_stats()
 //! - AES-128 / AES-192
 
-use s_zip::{AsyncStreamingZipReader, AsyncStreamingZipWriter, SeeklessZipWriter, StreamingZipWriter};
+use s_zip::{
+    AsyncStreamingZipReader, AsyncStreamingZipWriter, SeeklessZipWriter, StreamingZipWriter,
+};
 use std::io::Cursor;
 use tempfile::NamedTempFile;
 
@@ -22,8 +24,14 @@ async fn test_seekless_basic_roundtrip() {
     {
         let file = tokio::fs::File::create(&path).await.unwrap();
         let mut writer = SeeklessZipWriter::new(file);
-        writer.add_entry("hello.txt", b"Hello, world!").await.unwrap();
-        writer.add_entry("data.txt", b"Some data here").await.unwrap();
+        writer
+            .add_entry("hello.txt", b"Hello, world!")
+            .await
+            .unwrap();
+        writer
+            .add_entry("data.txt", b"Some data here")
+            .await
+            .unwrap();
         writer.finish().await.unwrap();
     }
 
@@ -85,8 +93,8 @@ fn test_sync_add_entry_convenience() {
     assert_eq!(writer.entry_count(), 0);
     writer.add_entry("file.txt", b"content").unwrap();
     assert_eq!(writer.entry_count(), 1); // in-progress entry counted
-    // bytes_written reflects completed entries; the entry is still in-progress
-    // after add_entry until the next start_entry or finish
+                                         // bytes_written reflects completed entries; the entry is still in-progress
+                                         // after add_entry until the next start_entry or finish
     writer.add_entry("file2.txt", b"more").unwrap(); // finishes the first entry
     assert_eq!(writer.entry_count(), 2);
     assert_eq!(writer.bytes_written(), 7); // first entry completed

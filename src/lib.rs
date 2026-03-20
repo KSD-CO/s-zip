@@ -283,10 +283,10 @@ impl ZipStats {
 
 #[cfg(feature = "async")]
 pub use async_writer::AsyncStreamingZipWriter;
-#[cfg(feature = "async")]
-pub use seekless::SeeklessZipWriter;
 #[cfg(feature = "encryption")]
 pub use encryption::AesStrength;
+#[cfg(feature = "async")]
+pub use seekless::SeeklessZipWriter;
 
 #[cfg(feature = "async")]
 pub use async_reader::{AsyncStreamingZipReader, GenericAsyncZipReader};

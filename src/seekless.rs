@@ -323,16 +323,14 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
             CompressionMethod::Deflate => {
                 let level = Compression::new(self.compression_level.min(9));
                 let mut encoder = DeflateEncoder::new(Vec::new(), level);
-                encoder
-                    .write_all(data)
-                    .map_err(SZipError::Io)?;
+                encoder.write_all(data).map_err(SZipError::Io)?;
                 let compressed = encoder.finish().map_err(SZipError::Io)?;
                 Ok((compressed, crc32, 8))
             }
             #[cfg(feature = "zstd-support")]
             CompressionMethod::Zstd => {
-                let compressed = zstd::encode_all(data, self.compression_level as i32)
-                    .map_err(SZipError::Io)?;
+                let compressed =
+                    zstd::encode_all(data, self.compression_level as i32).map_err(SZipError::Io)?;
                 Ok((compressed, crc32, 93))
             }
         }

@@ -102,7 +102,7 @@ impl AsyncStreamingZipReader {
         max_concurrent: Option<usize>,
     ) -> Result<Vec<(String, Vec<u8>)>> {
         use std::sync::Arc;
-        use tokio::sync::{Semaphore, mpsc};
+        use tokio::sync::{mpsc, Semaphore};
 
         let path = Arc::new(path.as_ref().to_path_buf());
         let concurrency = max_concurrent.unwrap_or(4).max(1);

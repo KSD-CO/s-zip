@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cursor = Cursor::new(zip_bytes.clone());
 
     // Use the generic async reader
-    let mut reader = GenericAsyncZipReader::new(cursor).await?;
+    let mut reader = GenericAsyncZipReader::new_with_buffer_size(cursor, None).await?;
 
     println!("   ✓ Successfully opened ZIP from in-memory source\n");
 
