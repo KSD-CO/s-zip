@@ -922,7 +922,7 @@ use tokio::io::AsyncRead;
 /// let s3_client = Client::new(&config);
 ///
 /// let reader = S3ZipReader::new(s3_client, "my-bucket", "archive.zip").await?;
-/// let mut zip = GenericAsyncZipReader::new(reader).await?;
+/// let mut zip = GenericAsyncZipReader::new_with_buffer_size(reader, None).await?;
 ///
 /// // List entries
 /// for entry in zip.entries() {
@@ -1233,4 +1233,11 @@ impl AsyncSeek for S3ZipReader {
 
 impl Unpin for S3ZipReader {}
 
+// SAFETY: Every field of `S3ZipReader` is `Send`: `Client` (aws-sdk-s3) is
+// `Send + Sync` (internally `Arc`-backed), `String`/`u64` are trivially `Send`,
+// and `read_future` is explicitly typed as
+// `Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>`. This impl should
+// in fact be derivable automatically; it is written explicitly to guarantee
+// `Send` remains enforced even if a future field addition would otherwise make
+// it non-obvious to the compiler (e.g. behind another `dyn Trait`).
 unsafe impl Send for S3ZipReader {}

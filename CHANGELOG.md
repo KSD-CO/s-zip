@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-09-04
+
+### Added ✨
+
+- **`extract_all()`** on `StreamingZipReader` (`src/reader.rs`) and `AsyncStreamingZipReader`
+  (`src/async_reader.rs`) — extracts every entry in the archive to a destination directory in
+  one call. Uses `safe_path()` to guard against zip-slip path traversal, creates parent
+  directories as needed, and uses the fully-verified `read_entry()` path so CRC32 (and HMAC for
+  encrypted entries) are checked for every extracted file.
+
+- **`add_directory()`** on `StreamingZipWriter` (`src/writer.rs`) and `AsyncStreamingZipWriter<W>`
+  (`src/async_writer.rs`) — recursively walks a directory and adds every file to the archive,
+  preserving relative paths (joined with `/`). Symlinks and other non-file/non-dir entries are
+  skipped.
+
+- **`SECURITY.md`** — vulnerability disclosure policy: supported versions, reporting instructions,
+  scope (in/out), known limitations, and disclosure policy.
+
+- **`deny.toml`** — `cargo-deny` configuration enforcing a permissive license allow-list,
+  advisory checks, and banned/unknown source registries.
+
+### Security 🔒
+
+- CI (`rust.yml`) now runs a `security` job on every push/PR: `cargo audit` and `cargo deny check`.
+- Documented 4 known RUSTSEC advisories (RUSTSEC-2026-0258, -0104, -0098, -0099) that are
+  unfixable transitive dependencies of the optional `cloud-s3` feature (via
+  `aws-smithy-http-client`'s bundled legacy TLS backend); explicitly ignored with tracking
+  comments in both `cargo audit` and `deny.toml`.
+- Added `SAFETY` documentation to the two `unsafe` blocks in the crate (`src/parallel.rs`
+  `CrcReader::consume()`, `src/cloud/s3.rs` `unsafe impl Send for S3ZipReader`).
+
+### Fixed 🐛
+
+- Fixed a broken doctest in `src/cloud/s3.rs` calling a non-existent
+  `GenericAsyncZipReader::new()` — corrected to `new_with_buffer_size()`.
+
+**Breaking Changes**: None.
+
 ## [0.12.0] - 2026-03-20
 
 ### Added ✨

@@ -14,7 +14,7 @@ use crc32fast::Hasher as Crc32;
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use std::fs::File;
-use std::io::{Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 #[cfg(feature = "encryption")]
@@ -401,6 +401,65 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
     pub fn add_entry(&mut self, name: &str, data: &[u8]) -> Result<()> {
         self.start_entry(name)?;
         self.write_data(data)
+    }
+
+    /// Recursively add every file under `dir_path` to the archive.
+    ///
+    /// Entry names are the file paths relative to `dir_path`, always joined
+    /// with forward slashes (`/`) regardless of the host OS, per the ZIP
+    /// spec. Files are streamed in 64 KB chunks rather than loaded fully into
+    /// memory. Empty subdirectories are not added as separate entries.
+    /// Symlinks and other non-regular files are skipped.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::StreamingZipWriter;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut writer = StreamingZipWriter::new("output.zip")?;
+    /// writer.add_directory("./my_folder")?;
+    /// writer.finish()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn add_directory<P: AsRef<Path>>(&mut self, dir_path: P) -> Result<()> {
+        let root = dir_path.as_ref().to_path_buf();
+        self.add_directory_inner(&root, &root)
+    }
+
+    fn add_directory_inner(&mut self, root: &Path, current: &Path) -> Result<()> {
+        for dir_entry in std::fs::read_dir(current)? {
+            let dir_entry = dir_entry?;
+            let path = dir_entry.path();
+            let file_type = dir_entry.file_type()?;
+
+            if file_type.is_dir() {
+                self.add_directory_inner(root, &path)?;
+            } else if file_type.is_file() {
+                let rel_path = path.strip_prefix(root).map_err(|_| {
+                    SZipError::InvalidFormat(
+                        "failed to compute relative path for directory entry".to_string(),
+                    )
+                })?;
+                let name = rel_path
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+
+                self.start_entry(&name)?;
+                let mut file = File::open(&path)?;
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    self.write_data(&buf[..n])?;
+                }
+            }
+            // Symlinks and other non-regular file types are skipped.
+        }
+        Ok(())
     }
 
     /// Number of entries fully written so far.

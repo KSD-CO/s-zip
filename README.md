@@ -3,6 +3,8 @@
 [![Crates.io](https://img.shields.io/crates/v/s-zip.svg)](https://crates.io/crates/s-zip)
 [![Documentation](https://docs.rs/s-zip/badge.svg)](https://docs.rs/s-zip)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/KSD-CO/s-zip/actions/workflows/rust.yml/badge.svg)](https://github.com/KSD-CO/s-zip/actions/workflows/rust.yml)
+[![Security Audit](https://img.shields.io/badge/security-audited%20in%20CI-brightgreen.svg)](SECURITY.md)
 
 ```text
 ███████╗      ███████╗██╗██████╗ 
@@ -26,14 +28,35 @@ High-performance streaming ZIP library for Rust backends. Process multi-gigabyte
 - 🗜️ **Multiple Codecs** - DEFLATE, Zstd (3x faster compression)
 - 🔌 **Seekless Streaming** - Stream ZIPs to HTTP responses, pipes, any `AsyncWrite` (no `Seek` needed)
 
+## Why s-zip?
+
+Most Rust ZIP crates (e.g. [`zip`](https://crates.io/crates/zip)) are designed around
+in-memory or seekable-file access. `s-zip` is built specifically for **backend/service**
+workloads: constant memory on multi-GB archives, first-class `async`/Tokio support,
+AES-256 encryption end-to-end (including streaming decrypt), and direct streaming to
+cloud object storage without touching local disk.
+
+| | `s-zip` | [`zip`](https://crates.io/crates/zip) | [`async_zip`](https://crates.io/crates/async_zip) |
+|---|---|---|---|
+| Streaming write (no `Seek` sink) | ✅ (`SeeklessZipWriter`) | ❌ | ✅ |
+| Streaming read (constant memory) | ✅ | Partial (whole entry buffered) | ✅ |
+| AES-256/192/128 encryption (sync + async) | ✅ | ❌ (no built-in AES) | ❌ |
+| Async/Tokio native | ✅ | ❌ | ✅ |
+| Direct S3 / GCS streaming | ✅ | ❌ | ❌ |
+| Parallel multi-file compression | ✅ | ❌ | ❌ |
+| ZIP64 (>4GB) | ✅ | ✅ | ✅ |
+| Zstd codec | ✅ | ✅ | ❌ |
+
+*Feature comparison only — see [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for s-zip's own throughput/memory numbers. We haven't run head-to-head benchmarks against other crates; take the table above as "does it support X", not a speed claim.*
+
 ## Quick Start
 
 ```toml
 [dependencies]
-s-zip = "0.12"
+s-zip = "0.13"
 
 # With all features
-s-zip = { version = "0.12", features = ["async", "encryption", "async-zstd", "cloud-all"] }
+s-zip = { version = "0.13", features = ["async", "encryption", "async-zstd", "cloud-all"] }
 ```
 
 ### Basic Usage
@@ -91,9 +114,24 @@ zip.write_data(br#"{"status": "ok"}"#).await?;
 zip.finish().await?;
 ```
 
-## What's New in v0.12.0
+## What's New in v0.13.0
 
-**P3 feature release** — seekless streaming, AES-128/192, parallel extraction, stats API, and convenience methods:
+**Security hardening + convenience methods** — directory/archive helpers and CI security scanning:
+
+- **`extract_all()`** on `StreamingZipReader` and `AsyncStreamingZipReader` — extract an entire archive
+  to a destination directory in one call, with zip-slip protection via `safe_path()` and full
+  CRC/HMAC verification per entry.
+
+- **`add_directory()`** on `StreamingZipWriter` and `AsyncStreamingZipWriter<W>` — recursively add a
+  whole directory tree to an archive in one call, preserving relative paths.
+
+- **`SECURITY.md`** — vulnerability disclosure policy, scope, and known limitations.
+
+- **CI security scanning** — `cargo audit` and `cargo deny` now run on every push/PR (`rust.yml`),
+  enforced via `deny.toml` (license allow-list, advisory checks, banned sources).
+
+**Previously (v0.12.0)**: seekless streaming, AES-128/192, parallel extraction, stats API, and
+convenience methods:
 
 - **`SeeklessZipWriter`** — stream ZIPs to HTTP response bodies, pipes, or any `AsyncWrite` without `Seek`.
   Pre-compresses each entry; peak RAM ≈ compressed entry size (negligible for compressible data).
@@ -245,6 +283,15 @@ More examples in [examples/](examples/) directory.
 - **Performance**: [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md)
 - **Examples**: [examples/](examples/)
 - **Changelog**: [CHANGELOG.md](CHANGELOG.md)
+
+## Security
+
+`s-zip` parses untrusted ZIP input and implements AES-256/192/128 + HMAC-SHA1
+encryption (WinZip-compatible). CI runs `cargo audit` and `cargo deny` on every push
+to catch known advisories and license/dependency issues.
+
+Found a vulnerability? **Do not open a public issue** — see [SECURITY.md](SECURITY.md)
+for private reporting instructions, scope, and known limitations.
 
 ## Non-Goals
 

@@ -152,6 +152,53 @@ impl AsyncStreamingZipReader {
         }
         Ok(results)
     }
+
+    /// Extract every entry in the archive into `dest_dir`, preserving relative
+    /// directory structure.
+    ///
+    /// Each entry's destination path is computed via [`ZipEntry::safe_path`],
+    /// which strips `..`, leading `/`/`\`, and Windows drive prefixes — so a
+    /// maliciously crafted archive cannot write outside `dest_dir` ("zip-slip").
+    /// Parent directories are created as needed, and existing files at the
+    /// destination are overwritten.
+    ///
+    /// Internally uses `read_entry()` (full read with CRC/HMAC verification)
+    /// for each file, so peak memory is bounded by the size of the largest
+    /// single entry rather than the whole archive.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::AsyncStreamingZipReader;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut reader = AsyncStreamingZipReader::open("archive.zip").await?;
+    /// reader.extract_all("./output_dir").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn extract_all<P: AsRef<Path>>(&mut self, dest_dir: P) -> Result<()> {
+        let dest_dir = dest_dir.as_ref();
+        let entries = self.entries.clone();
+        for entry in &entries {
+            let rel_path = entry.safe_path();
+            if rel_path.as_os_str().is_empty() {
+                continue;
+            }
+            let out_path = dest_dir.join(&rel_path);
+
+            if entry.name.ends_with('/') {
+                tokio::fs::create_dir_all(&out_path).await?;
+                continue;
+            }
+
+            if let Some(parent) = out_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            let data = self.read_entry(entry).await?;
+            tokio::fs::write(&out_path, data).await?;
+        }
+        Ok(())
+    }
 }
 
 impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {

@@ -438,6 +438,75 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         self.write_data(data).await
     }
 
+    /// Recursively add every file under `dir_path` (a local filesystem path) to
+    /// the archive.
+    ///
+    /// Entry names are the file paths relative to `dir_path`, always joined
+    /// with forward slashes (`/`) regardless of the host OS, per the ZIP
+    /// spec. Files are streamed in 64 KB chunks rather than loaded fully into
+    /// memory. Empty subdirectories are not added as separate entries.
+    /// Symlinks and other non-regular files are skipped.
+    ///
+    /// Works with any destination `W` — including `SeeklessZipWriter`-style
+    /// sinks, cloud writers, or plain files — since the source directory is
+    /// always read from the local filesystem via `tokio::fs`.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::AsyncStreamingZipWriter;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut writer = AsyncStreamingZipWriter::new("output.zip").await?;
+    /// writer.add_directory("./my_folder").await?;
+    /// writer.finish().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn add_directory<P: AsRef<Path>>(&mut self, dir_path: P) -> Result<()> {
+        let root = dir_path.as_ref().to_path_buf();
+        self.add_directory_inner(root.clone(), root).await
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    async fn add_directory_inner(
+        &mut self,
+        root: std::path::PathBuf,
+        current: std::path::PathBuf,
+    ) -> Result<()> {
+        let mut read_dir = tokio::fs::read_dir(&current).await?;
+        while let Some(dir_entry) = read_dir.next_entry().await? {
+            let path = dir_entry.path();
+            let file_type = dir_entry.file_type().await?;
+
+            if file_type.is_dir() {
+                Box::pin(self.add_directory_inner(root.clone(), path)).await?;
+            } else if file_type.is_file() {
+                let rel_path = path.strip_prefix(&root).map_err(|_| {
+                    SZipError::InvalidFormat(
+                        "failed to compute relative path for directory entry".to_string(),
+                    )
+                })?;
+                let name = rel_path
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+
+                self.start_entry(&name).await?;
+                let mut file = tokio::fs::File::open(&path).await?;
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    self.write_data(&buf[..n]).await?;
+                }
+            }
+            // Symlinks and other non-regular file types are skipped.
+        }
+        Ok(())
+    }
+
     /// Number of entries fully written so far.
     ///
     /// Includes any in-progress entry (started but not yet followed by

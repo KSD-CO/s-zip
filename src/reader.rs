@@ -101,6 +101,58 @@ impl StreamingZipReader {
         self.entries.iter().find(|e| e.name == name)
     }
 
+    /// Extract every entry in the archive into `dest_dir`, preserving relative
+    /// directory structure.
+    ///
+    /// Each entry's destination path is computed via [`ZipEntry::safe_path`],
+    /// which strips `..`, leading `/`/`\`, and Windows drive prefixes — so a
+    /// maliciously crafted archive cannot write outside `dest_dir` ("zip-slip").
+    /// Parent directories are created as needed, and existing files at the
+    /// destination are overwritten.
+    ///
+    /// Internally uses `read_entry()` (full read with CRC/HMAC verification)
+    /// for each file, so peak memory is bounded by the size of the largest
+    /// single entry rather than the whole archive. For very large entries
+    /// where that matters, iterate `entries()` manually and use
+    /// `read_entry_streaming()` instead.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::StreamingZipReader;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut reader = StreamingZipReader::open("archive.zip")?;
+    /// reader.extract_all("./output_dir")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn extract_all<P: AsRef<Path>>(&mut self, dest_dir: P) -> Result<()> {
+        let dest_dir = dest_dir.as_ref();
+        let entries = self.entries.clone();
+        for entry in &entries {
+            let rel_path = entry.safe_path();
+            if rel_path.as_os_str().is_empty() {
+                // Entry name sanitized to nothing (e.g. was only ".." or "/") — skip.
+                continue;
+            }
+            let out_path = dest_dir.join(&rel_path);
+
+            // Directory entries (conventionally named with a trailing '/') carry no
+            // data; just make sure the directory exists.
+            if entry.name.ends_with('/') {
+                std::fs::create_dir_all(&out_path)?;
+                continue;
+            }
+
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let data = self.read_entry(entry)?;
+            std::fs::write(&out_path, data)?;
+        }
+        Ok(())
+    }
+
     /// Read an entry's decompressed data into a vector
     pub fn read_entry(&mut self, entry: &ZipEntry) -> Result<Vec<u8>> {
         // Seek to local file header

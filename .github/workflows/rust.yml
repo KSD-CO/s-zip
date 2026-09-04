@@ -60,6 +60,53 @@ jobs:
     - name: Run doc tests
       run: cargo test --doc --verbose
 
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # RUSTSEC-2026-0258 (h2), RUSTSEC-2026-0104/0098/0099 (rustls-webpki) come from
+      # aws-smithy-http-client's legacy hyper 0.14 / rustls 0.21 TLS backend, pulled in
+      # transitively by aws-config/aws-sdk-s3 (cloud-s3 feature). Not fixable via `cargo
+      # update` — upstream pins that backend. Re-check when bumping aws-sdk-s3/aws-config.
+      - name: Audit dependencies (RUSTSEC advisories)
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2026-0258 \
+            --ignore RUSTSEC-2026-0104 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Check licenses, bans, and advisories
+        run: cargo deny check
+
   publish:
     name: Publish to crates.io
     needs: build

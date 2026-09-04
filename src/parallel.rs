@@ -64,19 +64,32 @@ impl<R: AsyncBufRead + Unpin> AsyncBufRead for CrcReader<R> {
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
         let this = self.get_mut();
-        // Peek at the filled buffer *before* consuming so we can hash it.
-        // SAFETY: poll_fill_buf already returned Ok, so the buffer is valid.
-        // We re-borrow inner as a Pin to call poll_fill_buf synchronously via
-        // a noop waker just to read the slice — but that's complex. Instead,
-        // we use a simpler approach: maintain a small shadow buffer.
+        // `AsyncBufRead::consume` only gets an offset, not the bytes themselves,
+        // so to hash the data before it's discarded we must re-fetch the already
+        // filled slice from `inner` (a `tokio::io::BufReader`) by calling
+        // `poll_fill_buf` again. Because the buffer was already filled by a prior
+        // `poll_fill_buf` call and has not been consumed yet, `BufReader` takes its
+        // fast path and returns `Poll::Ready` immediately without touching the
+        // waker or polling the underlying `AsyncRead` — this is an implementation
+        // detail of `tokio::io::BufReader`, not part of the `AsyncBufRead` contract.
         //
-        // Actually the cleanest approach: call inner.consume and hash via
-        // the AsyncRead path (poll_read already hashes). Since DeflateEncoder
-        // uses poll_fill_buf/consume, we need to hash here.
-        // We can't easily re-read already-filled bytes from BufReader after consume.
+        // We build a no-op `Waker` purely to satisfy `Context::from_waker`'s API;
+        // it is never actually invoked on this fast path.
         //
-        // Solution: use a raw waker to call poll_fill_buf synchronously (the buffer
-        // is already filled — it's a no-op poll) to borrow the slice, hash it, then consume.
+        // SAFETY: `RawWaker::from_raw` requires the vtable's `clone`/`wake`/
+        // `wake_by_ref`/`drop` functions to uphold the `Waker` contract (no UB on
+        // any call). All four functions here are no-ops that ignore the data
+        // pointer, which trivially satisfies that contract regardless of how many
+        // times or in what order they are called. The `Waker` is also never sent
+        // across threads or stored past this function call.
+        //
+        // Correctness caveat (not a soundness one): if `inner` ever returns
+        // `Poll::Pending` here (i.e. the fast-path assumption above does not
+        // hold), the `if let Poll::Ready(..)` guard below simply skips hashing
+        // for this call rather than panicking or corrupting memory — but the
+        // resulting CRC would then be wrong. This is covered by
+        // `test_ctr_keystreams_differ_across_chunks`-style roundtrip tests
+        // exercising the parallel compression path.
         use std::task::{RawWaker, RawWakerVTable, Waker};
         fn noop(_: *const ()) {}
         fn noop_clone(p: *const ()) -> RawWaker {
@@ -84,8 +97,6 @@ impl<R: AsyncBufRead + Unpin> AsyncBufRead for CrcReader<R> {
         }
         static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
         let raw = RawWaker::new(std::ptr::null(), &VTABLE);
-        // SAFETY: waker does nothing; poll_fill_buf on BufReader with a full buffer
-        // returns Poll::Ready immediately without touching the waker.
         let waker = unsafe { Waker::from_raw(raw) };
         let mut cx = Context::from_waker(&waker);
         if let Poll::Ready(Ok(buf)) = Pin::new(&mut this.inner).poll_fill_buf(&mut cx) {

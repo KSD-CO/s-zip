@@ -1,0 +1,46 @@
+# cargo-deny configuration for s-zip
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+targets = []
+
+[advisories]
+version = 2
+yanked = "deny"
+# RUSTSEC-2026-0258 (h2), RUSTSEC-2026-0104/0098/0099 (rustls-webpki): transitive via
+# aws-smithy-http-client's legacy hyper 0.14 / rustls 0.21 TLS backend, pulled in by
+# aws-config/aws-sdk-s3 (cloud-s3 feature). Not resolvable via `cargo update` — upstream
+# pins that backend version. Re-check when bumping aws-sdk-s3/aws-config in Cargo.toml.
+ignore = [
+    "RUSTSEC-2026-0258",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
