@@ -94,6 +94,11 @@ harness = false
 required-features = ["async"]
 
 [[bench]]
+name = "async_read_bench"
+harness = false
+required-features = ["async"]
+
+[[bench]]
 name = "encryption_bench"
 harness = false
 required-features = ["encryption"]

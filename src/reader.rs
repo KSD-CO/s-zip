@@ -205,7 +205,7 @@ impl StreamingZipReader {
         }
 
         // Skip version
-        self.file.seek(SeekFrom::Current(2))?;
+        self.file.seek_relative(2)?;
 
         // Read flags to check for encryption
         let flags = self.read_u16_le()?;
@@ -217,17 +217,17 @@ impl StreamingZipReader {
         // Read modification time (ZipCrypto check byte), skip date and CRC-32
         #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
         let mod_time = self.read_u16_le()?;
-        self.file.seek(SeekFrom::Current(6))?;
+        self.file.seek_relative(6)?;
 
         // Read compressed and uncompressed sizes (already known from central directory)
-        self.file.seek(SeekFrom::Current(8))?;
+        self.file.seek_relative(8)?;
 
         // Read filename length and extra field length
         let filename_len = self.read_u16_le()? as i64;
         let extra_len = self.read_u16_le()? as usize;
 
         // Skip filename
-        self.file.seek(SeekFrom::Current(filename_len))?;
+        self.file.seek_relative(filename_len)?;
 
         // Check for AES encryption in extra field
         #[cfg(feature = "encryption")]
@@ -235,7 +235,7 @@ impl StreamingZipReader {
             self.parse_aes_extra_field(extra_len)?
         } else {
             // Skip extra field if not encrypted
-            self.file.seek(SeekFrom::Current(extra_len as i64))?;
+            self.file.seek_relative(extra_len as i64)?;
             None
         };
 
@@ -247,7 +247,7 @@ impl StreamingZipReader {
                 ));
             }
             // Skip extra field
-            self.file.seek(SeekFrom::Current(extra_len as i64))?;
+            self.file.seek_relative(extra_len as i64)?;
         }
 
         // Calculate actual data size (subtract salt, password verify, and auth code for encrypted entries)
@@ -476,24 +476,24 @@ impl StreamingZipReader {
         }
 
         // Skip version; read flags; skip compression method
-        self.file.seek(SeekFrom::Current(2))?;
+        self.file.seek_relative(2)?;
         let flags = self.read_u16_le()?;
-        self.file.seek(SeekFrom::Current(2))?;
+        self.file.seek_relative(2)?;
 
         // Read modification time (ZipCrypto check byte), skip date and CRC-32
         #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
         let mod_time = self.read_u16_le()?;
-        self.file.seek(SeekFrom::Current(6))?;
+        self.file.seek_relative(6)?;
 
         // Read compressed and uncompressed sizes (use values from central directory)
-        self.file.seek(SeekFrom::Current(8))?;
+        self.file.seek_relative(8)?;
 
         // Read filename length and extra field length
         let filename_len = self.read_u16_le()? as i64;
         let extra_len = self.read_u16_le()? as usize;
 
         // Skip filename
-        self.file.seek(SeekFrom::Current(filename_len))?;
+        self.file.seek_relative(filename_len)?;
 
         // For encrypted entries: parse AES extra field and decrypt on-the-fly.
         #[cfg(feature = "encryption")]
@@ -566,11 +566,11 @@ impl StreamingZipReader {
         // Non-encrypted path: skip extra field
         #[cfg(feature = "encryption")]
         if !entry.is_encrypted {
-            self.file.seek(SeekFrom::Current(extra_len as i64))?;
+            self.file.seek_relative(extra_len as i64)?;
         }
 
         #[cfg(not(feature = "encryption"))]
-        self.file.seek(SeekFrom::Current(extra_len as i64))?;
+        self.file.seek_relative(extra_len as i64)?;
 
         // Create a reader limited to compressed data size
         let limited_reader = (&mut self.file).take(entry.compressed_size);
@@ -606,7 +606,7 @@ impl StreamingZipReader {
         }
 
         // Skip disk number fields (4 bytes)
-        file.seek(SeekFrom::Current(4))?;
+        file.seek_relative(4)?;
 
         // Read number of entries on this disk (2 bytes)
         let _entries_on_disk = Self::read_u16_le_static(file)?;
@@ -655,7 +655,7 @@ impl StreamingZipReader {
             }
 
             // Skip version made by, version needed
-            file.seek(SeekFrom::Current(4))?;
+            file.seek_relative(4)?;
 
             // Read flags (needed for encryption check)
             #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
@@ -664,7 +664,7 @@ impl StreamingZipReader {
             let compression_method = Self::read_u16_le_static(file)?;
 
             // Read modification time, date, and CRC-32
-            file.seek(SeekFrom::Current(4))?; // mod time + date
+            file.seek_relative(4)?; // mod time + date
             let crc32 = Self::read_u32_le_static(file)?;
 
             // Read sizes as 32-bit placeholders (may be 0xFFFFFFFF meaning ZIP64)
@@ -675,7 +675,7 @@ impl StreamingZipReader {
             let comment_len = Self::read_u16_le_static(file)? as usize;
 
             // Skip disk number, internal attributes, external attributes
-            file.seek(SeekFrom::Current(8))?;
+            file.seek_relative(8)?;
 
             let offset_32 = Self::read_u32_le_static(file)? as u64;
 
@@ -754,7 +754,7 @@ impl StreamingZipReader {
         };
 
         // skip version made by (2), version needed (2), disk number (4), disk where central dir starts (4)
-        file.seek(SeekFrom::Current(12))?;
+        file.seek_relative(12)?;
 
         // total number of entries on this disk (8)
         let total_entries = {

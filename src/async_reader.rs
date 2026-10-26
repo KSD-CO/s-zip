@@ -304,38 +304,36 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         }
 
         // Skip version (2 bytes)
-        self.reader.seek(SeekFrom::Current(2)).await?;
+        skip_bytes(&mut self.reader, 2).await?;
 
         // Read flags to check for encryption
         let flags = self.read_u16_le().await?;
         let is_encrypted_local = (flags & 0x01) != 0;
 
         // Read compression method (skip — use value from central directory)
-        self.reader.seek(SeekFrom::Current(2)).await?;
+        skip_bytes(&mut self.reader, 2).await?;
 
         // Read modification time (ZipCrypto check byte), skip date and CRC-32
         #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
         let mod_time = self.read_u16_le().await?;
-        self.reader.seek(SeekFrom::Current(6)).await?;
+        skip_bytes(&mut self.reader, 6).await?;
 
         // Skip compressed and uncompressed sizes (use from central directory)
-        self.reader.seek(SeekFrom::Current(8)).await?;
+        skip_bytes(&mut self.reader, 8).await?;
 
         // Read filename length and extra field length
         let filename_len = self.read_u16_le().await? as i64;
         let extra_len = self.read_u16_le().await? as usize;
 
         // Skip filename
-        self.reader.seek(SeekFrom::Current(filename_len)).await?;
+        skip_bytes(&mut self.reader, filename_len).await?;
 
         // Parse AES extra field if encrypted
         #[cfg(feature = "encryption")]
         let encryption_info = if is_encrypted_local {
             self.parse_aes_extra_field(extra_len).await?
         } else {
-            self.reader
-                .seek(SeekFrom::Current(extra_len as i64))
-                .await?;
+            skip_bytes(&mut self.reader, extra_len as i64).await?;
             None
         };
 
@@ -346,9 +344,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
                     "Encrypted entry found but encryption feature not enabled".to_string(),
                 ));
             }
-            self.reader
-                .seek(SeekFrom::Current(extra_len as i64))
-                .await?;
+            skip_bytes(&mut self.reader, extra_len as i64).await?;
         }
 
         // Guard against OOM from corrupt/malicious compressed_size values.
@@ -567,24 +563,24 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         }
 
         // Skip version; read flags; skip compression method
-        self.reader.seek(SeekFrom::Current(2)).await?;
+        skip_bytes(&mut self.reader, 2).await?;
         let flags = self.read_u16_le().await?;
-        self.reader.seek(SeekFrom::Current(2)).await?;
+        skip_bytes(&mut self.reader, 2).await?;
 
         // Read modification time (ZipCrypto check byte), skip date and CRC-32
         #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
         let mod_time = self.read_u16_le().await?;
-        self.reader.seek(SeekFrom::Current(6)).await?;
+        skip_bytes(&mut self.reader, 6).await?;
 
         // Read compressed and uncompressed sizes (use from central directory)
-        self.reader.seek(SeekFrom::Current(8)).await?;
+        skip_bytes(&mut self.reader, 8).await?;
 
         // Read filename length and extra field length
         let filename_len = self.read_u16_le().await? as i64;
         let extra_len = self.read_u16_le().await? as usize;
 
         // Skip filename
-        self.reader.seek(SeekFrom::Current(filename_len)).await?;
+        skip_bytes(&mut self.reader, filename_len).await?;
 
         // For encrypted entries: decrypt on-the-fly.
         #[cfg(feature = "encryption")]
@@ -656,15 +652,11 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         // Non-encrypted path: skip extra field
         #[cfg(feature = "encryption")]
         if !entry.is_encrypted {
-            self.reader
-                .seek(SeekFrom::Current(extra_len as i64))
-                .await?;
+            skip_bytes(&mut self.reader, extra_len as i64).await?;
         }
 
         #[cfg(not(feature = "encryption"))]
-        self.reader
-            .seek(SeekFrom::Current(extra_len as i64))
-            .await?;
+        skip_bytes(&mut self.reader, extra_len as i64).await?;
 
         // Create a reader limited to compressed data size
         let limited_reader = (&mut self.reader).take(entry.compressed_size);
@@ -703,7 +695,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         }
 
         // Skip disk number fields (4 bytes)
-        reader.seek(SeekFrom::Current(4)).await?;
+        skip_bytes(reader, 4).await?;
 
         // Read number of entries on this disk (2 bytes)
         let _entries_on_disk = Self::read_u16_le_static(reader).await?;
@@ -751,14 +743,14 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
             }
 
             // Skip version made by (2), version needed (2); read flags (2)
-            reader.seek(SeekFrom::Current(4)).await?;
+            skip_bytes(reader, 4).await?;
             let flags = Self::read_u16_le_static(reader).await?;
             let is_encrypted = (flags & 0x01) != 0;
 
             let compression_method = Self::read_u16_le_static(reader).await?;
 
             // Read modification time, date, and CRC-32
-            reader.seek(SeekFrom::Current(4)).await?; // mod time + date
+            skip_bytes(reader, 4).await?; // mod time + date
             let crc32 = Self::read_u32_le_static(reader).await?;
 
             // Read sizes as 32-bit placeholders (may be 0xFFFFFFFF meaning ZIP64)
@@ -769,7 +761,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
             let comment_len = Self::read_u16_le_static(reader).await? as usize;
 
             // Skip disk number, internal attributes, external attributes
-            reader.seek(SeekFrom::Current(8)).await?;
+            skip_bytes(reader, 8).await?;
 
             let offset_32 = Self::read_u32_le_static(reader).await? as u64;
 
@@ -851,7 +843,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         };
 
         // skip version made by (2), version needed (2), disk number (4), disk where central dir starts (4)
-        reader.seek(SeekFrom::Current(12)).await?;
+        skip_bytes(reader, 12).await?;
 
         // total number of entries on this disk (8)
         let total_entries = {
@@ -989,4 +981,20 @@ async fn decompressing_reader<'a, R: AsyncRead + Unpin + Send + 'a>(
         }
         m => Err(SZipError::UnsupportedCompression(m)),
     }
+}
+
+/// Skip `n` bytes forward. Unlike `seek`, this keeps `BufReader`'s buffer when
+/// the skipped bytes are already buffered, avoiding a refill of up to the full
+/// buffer capacity for every small skip.
+async fn skip_bytes<R: AsyncRead + AsyncSeek + Unpin>(
+    reader: &mut BufReader<R>,
+    n: i64,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    if n >= 0 && (n as usize) <= reader.buffer().len() {
+        reader.consume(n as usize);
+    } else {
+        reader.seek(SeekFrom::Current(n)).await?;
+    }
+    Ok(())
 }
