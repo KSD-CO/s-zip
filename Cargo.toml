@@ -40,6 +40,8 @@ aws-sdk-s3 = { version = "1.80", optional = true, default-features = false, feat
 google-cloud-storage = { version = "1.21", optional = true }
 bytes = { version = "1", optional = true }
 tokio-util = { version = "0.7", optional = true }
+azure_storage_blob = { version = "1.1", optional = true }
+azure_core = { version = "1.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.8"
@@ -49,6 +51,9 @@ tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
 proptest = "1.4"
 bzip2 = "0.6"
 liblzma = "0.4"
+hmac = "0.13"
+sha2 = "0.11"
+google-cloud-auth = "1.18"
 
 [features]
 default = []
@@ -60,7 +65,8 @@ async = ["tokio", "async-compression", "futures-util", "pin-project-lite"]
 async-zstd = ["async", "zstd-support", "async-compression/zstd"]
 cloud-s3 = ["async", "aws-config", "aws-sdk-s3", "tokio-util"]
 cloud-gcs = ["async", "google-cloud-storage", "bytes", "tokio-util"]
-cloud-all = ["cloud-s3", "cloud-gcs"]
+cloud-azure = ["async", "azure_storage_blob", "azure_core", "tokio-util", "bytes"]
+cloud-all = ["cloud-s3", "cloud-gcs", "cloud-azure"]
 
 [[bench]]
 name = "compression_bench"

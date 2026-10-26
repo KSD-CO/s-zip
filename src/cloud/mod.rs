@@ -8,6 +8,7 @@
 //!
 //! - **S3** - AWS S3 multipart upload and ranged reads (requires `cloud-s3` feature)
 //! - **GCS** - Google Cloud Storage resumable upload and ranged reads (requires `cloud-gcs` feature)
+//! - **Azure** - Azure Blob Storage block upload and ranged reads (requires `cloud-azure` feature)
 //!
 //! ## S3-Compatible Services
 //!
@@ -65,8 +66,14 @@ pub mod s3;
 #[cfg(feature = "cloud-gcs")]
 pub mod gcs;
 
+#[cfg(feature = "cloud-azure")]
+pub mod azure;
+
 #[cfg(feature = "cloud-s3")]
 pub use s3::{S3ZipReader, S3ZipReaderBuilder, S3ZipWriter, S3ZipWriterBuilder};
+
+#[cfg(feature = "cloud-azure")]
+pub use azure::{AzureZipReader, AzureZipWriter, AzureZipWriterBuilder};
 
 #[cfg(feature = "cloud-gcs")]
 pub use gcs::{GCSZipReader, GCSZipWriter, GCSZipWriterBuilder};

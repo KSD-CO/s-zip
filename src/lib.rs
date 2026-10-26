@@ -115,7 +115,7 @@ pub mod seekless;
 #[cfg(feature = "async")]
 pub mod stream_reader;
 
-#[cfg(any(feature = "cloud-s3", feature = "cloud-gcs"))]
+#[cfg(any(feature = "cloud-s3", feature = "cloud-gcs", feature = "cloud-azure"))]
 pub mod cloud;
 
 pub use error::{Result, SZipError};

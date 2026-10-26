@@ -1,5 +1,11 @@
 //! Reading legacy archives: ZipCrypto (Info-ZIP `zip -P`) and bzip2 / LZMA / XZ.
 
+// Helpers are shared by tests that are gated on different features
+#![cfg_attr(
+    not(all(feature = "encryption", feature = "legacy-codecs")),
+    allow(dead_code, unused_imports)
+)]
+
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
