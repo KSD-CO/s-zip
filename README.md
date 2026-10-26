@@ -194,6 +194,7 @@ s-zip unpack backup.zip -d ./restore     # ZIP bomb limits on by default
 
 **Faster** — opening a 20 000-entry archive went from 592 ms to 1.4 ms (async: 2.07 s to 2.7 ms);
 many-entry reads are 30–74 % faster and many-entry writes 61–78 % faster than v0.14.0.
+Writing a 200 MiB entry now peaks at ~16 MiB RSS instead of 88–122 MiB.
 
 **Interoperability fixes** (verified with Info-ZIP `unzip`/`zipinfo`):
 - Non-ASCII names now carry the UTF-8 flag (no more garbled names in Windows Explorer).

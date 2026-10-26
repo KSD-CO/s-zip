@@ -54,7 +54,8 @@ struct ZipEntry {
     #[cfg(feature = "encryption")]
     #[allow(dead_code)] // Will be used for central directory in future versions
     encryption_strength: Option<u16>,
-    meta: crate::EntryMeta,
+    /// `None` for entries without custom metadata (see `PLAIN_META`)
+    meta: Option<Box<crate::EntryMeta>>,
 }
 
 /// Streaming ZIP writer that compresses data on-the-fly
@@ -706,24 +707,16 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         // Check if buffer should be flushed to output
         let buffer = entry.encoder.get_buffer_mut();
         if buffer.should_flush() {
-            // Flush buffer to output to keep memory usage low
-            let compressed_data = buffer.take();
-
-            // Encrypt compressed data if encryption is enabled and password is set
+            // Flush buffer to output to keep memory usage low. Write and clear in
+            // place: taking the Vec would drop its capacity and regrow it from zero on
+            // every flush, which made RSS grow with the amount of data written.
             #[cfg(feature = "encryption")]
-            let data_to_write = if let Some(ref mut encryptor) = entry.encryptor {
-                let mut data_to_encrypt = compressed_data;
-                encryptor.encrypt(&mut data_to_encrypt)?;
-                data_to_encrypt
-            } else {
-                compressed_data
-            };
-
-            #[cfg(not(feature = "encryption"))]
-            let data_to_write = compressed_data;
-
-            self.output.write_all(&data_to_write)?;
-            entry.counter.add_compressed(data_to_write.len() as u64);
+            if let Some(ref mut encryptor) = entry.encryptor {
+                encryptor.encrypt(&mut buffer.buffer)?;
+            }
+            self.output.write_all(&buffer.buffer)?;
+            entry.counter.add_compressed(buffer.buffer.len() as u64);
+            buffer.buffer.clear();
         }
 
         Ok(())
@@ -799,7 +792,7 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
                 compression_method: entry.compression_method,
                 #[cfg(feature = "encryption")]
                 encryption_strength: encryption_strength_code,
-                meta: entry.meta,
+                meta: entry.meta.boxed_if_custom(),
             });
         }
         Ok(())
@@ -816,8 +809,9 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         for entry in &self.entries {
             // Assemble each central directory record in memory and write it once
             let mut record = Vec::with_capacity(128 + entry.name.len());
+            let meta = entry.meta.as_deref().unwrap_or(&crate::PLAIN_META);
             record.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]); // central dir sig
-            record.extend_from_slice(&entry.meta.version_made_by.to_le_bytes()); // version made by
+            record.extend_from_slice(&meta.version_made_by.to_le_bytes()); // version made by
             record.extend_from_slice(&cd_version_needed(entry).to_le_bytes()); // version needed
 
             // Set encryption flag (bit 0) if entry was encrypted
@@ -832,8 +826,8 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
 
             record.extend_from_slice(&[flags, crate::format::FLAG_UTF8_HI]); // general purpose bit flag
             record.extend_from_slice(&entry.compression_method.to_le_bytes()); // compression method
-            record.extend_from_slice(&entry.meta.dos_time.to_le_bytes());
-            record.extend_from_slice(&entry.meta.dos_date.to_le_bytes());
+            record.extend_from_slice(&meta.dos_time.to_le_bytes());
+            record.extend_from_slice(&meta.dos_date.to_le_bytes());
             record.extend_from_slice(&entry.crc32.to_le_bytes());
 
             // Write sizes (32-bit placeholders or actual values)
@@ -852,7 +846,7 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             record.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
 
             // Prepare extra fields
-            let mut extra_field: Vec<u8> = entry.meta.unix_extra.clone();
+            let mut extra_field: Vec<u8> = meta.unix_extra.clone();
 
             // Add AES extra field if entry was encrypted
             #[cfg(feature = "encryption")]
@@ -890,10 +884,10 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             }
 
             record.extend_from_slice(&(extra_field.len() as u16).to_le_bytes()); // extra len
-            record.extend_from_slice(&(entry.meta.comment.len() as u16).to_le_bytes()); // file comment len
+            record.extend_from_slice(&(meta.comment.len() as u16).to_le_bytes()); // file comment len
             record.extend_from_slice(&0u16.to_le_bytes()); // disk number start
             record.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
-            record.extend_from_slice(&entry.meta.external_attrs.to_le_bytes()); // external attrs
+            record.extend_from_slice(&meta.external_attrs.to_le_bytes()); // external attrs
 
             // local header offset (32-bit or 0xFFFFFFFF)
             if entry.local_header_offset > u32::MAX as u64 {
@@ -906,7 +900,7 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             if !extra_field.is_empty() {
                 record.extend_from_slice(&extra_field);
             }
-            record.extend_from_slice(&entry.meta.comment);
+            record.extend_from_slice(&meta.comment);
             self.output.write_all(&record)?;
         }
 
