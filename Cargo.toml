@@ -1,6 +1,6 @@
 [package]
 name = "s-zip"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 authors = ["Ton That Vu <ttvuhm@gmail.com>"]
 description = "High-performance streaming ZIP library with AES-256 encryption and async/await support - Read/write ZIP files with minimal memory footprint. Supports password protection, cloud storage, and Tokio runtime."
@@ -23,8 +23,12 @@ sha1 = { version = "0.11", optional = true }
 pbkdf2 = { version = "0.13", optional = true }
 getrandom = { version = "0.4", optional = true }
 
+# Legacy codecs, read-only (optional)
+bzip2 = { version = "0.6", optional = true }
+liblzma = { version = "0.4", optional = true }
+
 # Async dependencies (optional)
-tokio = { version = "1.35", optional = true, features = ["io-util", "fs", "sync", "rt"] }
+tokio = { version = "1.35", optional = true, features = ["io-util", "fs", "sync", "rt", "macros"] }
 async-compression = { version = "0.4", optional = true, features = ["tokio", "deflate", "zstd"] }
 futures-util = { version = "0.3", optional = true }
 pin-project-lite = { version = "0.2", optional = true }
@@ -35,6 +39,12 @@ aws-config = { version = "1.5", optional = true, features = ["behavior-version-l
 aws-sdk-s3 = { version = "1.80", optional = true, default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "http-1x"] }
 google-cloud-storage = { version = "1.21", optional = true }
 bytes = { version = "1", optional = true }
+tokio-util = { version = "0.7", optional = true }
+azure_storage_blob = { version = "1.1", optional = true }
+azure_core = { version = "1.1", optional = true }
+
+# Command-line tool (optional)
+clap = { version = "4.5", optional = true, features = ["derive", "env"] }
 
 [dev-dependencies]
 tempfile = "3.8"
@@ -42,17 +52,29 @@ criterion = { version = "0.8", features = ["html_reports"] }
 tokio-test = "0.4"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
 proptest = "1.4"
+bzip2 = "0.6"
+liblzma = "0.4"
+hmac = "0.13"
+sha2 = "0.11"
+google-cloud-auth = "1.18"
 
 [features]
 default = []
 tracing = ["dep:tracing"]
 zstd-support = ["zstd"]
+legacy-codecs = ["dep:bzip2", "dep:liblzma", "async-compression?/bzip2", "async-compression?/lzma", "async-compression?/xz"]
 encryption = ["aes", "ctr", "hmac", "sha1", "pbkdf2", "getrandom"]
 async = ["tokio", "async-compression", "futures-util", "pin-project-lite"]
 async-zstd = ["async", "zstd-support", "async-compression/zstd"]
-cloud-s3 = ["async", "aws-config", "aws-sdk-s3"]
-cloud-gcs = ["async", "google-cloud-storage", "bytes"]
-cloud-all = ["cloud-s3", "cloud-gcs"]
+cloud-s3 = ["async", "aws-config", "aws-sdk-s3", "tokio-util"]
+cloud-gcs = ["async", "google-cloud-storage", "bytes", "tokio-util"]
+cloud-azure = ["async", "azure_storage_blob", "azure_core", "tokio-util", "bytes"]
+cloud-all = ["cloud-s3", "cloud-gcs", "cloud-azure"]
+cli = ["dep:clap", "encryption", "zstd-support", "legacy-codecs"]
+
+[[bin]]
+name = "s-zip"
+required-features = ["cli"]
 
 [[bench]]
 name = "compression_bench"

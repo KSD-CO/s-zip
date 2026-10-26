@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-10-26
+
+### Added ✨
+
+- **`ExtractLimits`** (`src/limits.rs`) — ZIP bomb protection for all readers: per-entry size,
+  total size, compression ratio and entry-count limits, enforced on the bytes the decompressor
+  actually produces. `ExtractLimits::strict()` is a preset for untrusted archives.
+- **`ZipStreamReader`** (`src/stream_reader.rs`) — sequential reads from non-seekable sources
+  (HTTP bodies, pipes, stdin) via local headers and data descriptors.
+- **`GCSZipReader`** — ranged reads from Google Cloud Storage, pinned to the object generation.
+- **Azure Blob Storage** (`cloud-azure` feature) — `AzureZipWriter` (parallel block staging,
+  commit on `finish()`) and `AzureZipReader` (ranged reads pinned to the ETag).
+- **Legacy archives** — ZipCrypto decryption (read-only, `encryption` feature) and bzip2 / LZMA /
+  XZ decompression (`legacy-codecs` feature).
+- **Comments** — `set_comment()` on all writers, `EntryOptions::comment`, `comment()` on readers
+  and `ZipEntry::comment`.
+- `AsyncStreamingZipWriter::start_entry_with_options()`.
+- **`s-zip` CLI** (`cli` feature) — `pack`, `unpack`, `list`, `test`.
+- Cloud end-to-end tests against s3mock / Azurite / fake-gcs-server, run in CI.
+
+### Fixed 🐛
+
+- Non-ASCII entry names were written without the UTF-8 flag (garbled in Windows Explorer and
+  other tools); readers now also decode legacy CP437 names.
+- `StreamingZipWriter` corrupted every entry written with `EntryOptions::unix_mode`: the Unix extra
+  field was counted in the local header but never written.
+- `AsyncStreamingZipWriter` archives could not be extracted with Info-ZIP `unzip` (every entry
+  claimed to need PKZIP 5.1). Version-needed is now 5.1 only for AES, 4.5 for ZIP64, else 2.0.
+- Modification times and Unix permissions were missing from the central directory of the streaming
+  writers; "version made by" now marks Unix hosts and bare modes get `S_IFREG`.
+- S3 uploads were effectively sequential despite `max_concurrent_uploads`; S3/GCS writers buffered
+  without bound when the network was slower than the producer. Writers now apply backpressure, and
+  failed or abandoned S3 multipart uploads are aborted.
+- In-memory reads (`read_entry`) are capped at 2 GiB of decompressed output by default.
+
+### Changed ⚠️ (breaking)
+
+- `ZipEntry` has a new `comment` field and `EntryOptions` a new `comment` field (use
+  `..Default::default()` when constructing `EntryOptions`).
+- `SZipError` is now `#[non_exhaustive]` and has a new `LimitExceeded` variant.
+
 ## [0.14.0] - 2026-10-26
 
 ### Changed ⚠️ (breaking)

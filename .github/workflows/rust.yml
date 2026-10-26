@@ -63,6 +63,34 @@ jobs:
     - name: Run doc tests
       run: cargo test --doc --verbose
 
+  cloud-e2e:
+    name: Cloud end-to-end (emulators)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+
+    - name: Start S3, Azure and GCS emulators
+      run: |
+        docker run -d -p 9000:9090 -e initialBuckets=szip adobe/s3mock
+        docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
+          azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+        docker run -d -p 80:4443 fsouza/fake-gcs-server -scheme http -port 4443 \
+          -external-url http://localhost
+        for port in 9000 10000 80; do
+          timeout 60 bash -c "until curl -s -o /dev/null localhost:$port; do sleep 1; done"
+        done
+
+    - name: Run cloud tests
+      run: cargo test --all-features --test cloud_e2e -- --ignored
+
   security:
     name: Security audit
     runs-on: ubuntu-latest

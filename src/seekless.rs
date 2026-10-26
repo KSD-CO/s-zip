@@ -57,6 +57,8 @@ struct PreparedEntry {
     dos_date: u16,
     unix_extra: Vec<u8>,
     external_attrs: u32,
+    version_made_by: u16,
+    comment: Vec<u8>,
 }
 
 /// Seekless async ZIP writer — works with any `AsyncWrite + Unpin` sink.
@@ -68,6 +70,8 @@ pub struct SeeklessZipWriter<W: AsyncWrite + Unpin> {
     bytes_out: u64,
     compression_level: u32,
     compression_method: CompressionMethod,
+    /// Archive comment written after the end-of-central-directory record
+    comment: Vec<u8>,
 }
 
 impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
@@ -84,6 +88,7 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
             bytes_out: 0,
             compression_level: level,
             compression_method: CompressionMethod::Deflate,
+            comment: Vec::new(),
         }
     }
 
@@ -95,7 +100,16 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
             bytes_out: 0,
             compression_level: level,
             compression_method: method,
+            comment: Vec::new(),
         }
+    }
+
+    /// Set the archive comment (at most 65 535 bytes), written by `finish()`.
+    pub fn set_comment(&mut self, comment: impl Into<String>) -> Result<&mut Self> {
+        let comment = comment.into().into_bytes();
+        crate::check_comment_len(&comment)?;
+        self.comment = comment;
+        Ok(self)
     }
 
     /// Number of entries staged so far.
@@ -129,9 +143,10 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
 
         let uncompressed_size = data.len() as u64;
         let compressed_size = compressed.len() as u64;
-        let (dos_time, dos_date) = options.msdos_datetime();
-        let unix_extra = options.unix_extra_field();
-        let external_attrs = options.external_attrs();
+        let meta = options.meta()?;
+        let (dos_time, dos_date) = (meta.dos_time, meta.dos_date);
+        let unix_extra = meta.unix_extra;
+        let external_attrs = meta.external_attrs;
 
         // Record the local-header offset *before* writing
         let local_header_offset = self.bytes_out;
@@ -149,7 +164,7 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
         let mut header = Vec::with_capacity(30 + name_bytes.len() + extra_field_local.len());
         header.extend_from_slice(&0x04034b50u32.to_le_bytes()); // local sig
         header.extend_from_slice(&version_needed.to_le_bytes());
-        header.extend_from_slice(&0u16.to_le_bytes()); // flags
+        header.extend_from_slice(&crate::format::FLAG_UTF8.to_le_bytes()); // flags
         header.extend_from_slice(&method_u16.to_le_bytes());
         header.extend_from_slice(&dos_time.to_le_bytes());
         header.extend_from_slice(&dos_date.to_le_bytes());
@@ -188,6 +203,8 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
             dos_date,
             unix_extra: entry_unix_extra,
             external_attrs,
+            version_made_by: meta.version_made_by,
+            comment: meta.comment,
         });
 
         Ok(())
@@ -234,9 +251,12 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
 
             let mut cd = Vec::new();
             cd.extend_from_slice(&0x02014b50u32.to_le_bytes()); // central dir sig
-            cd.extend_from_slice(&version_needed.to_le_bytes()); // version made by
+                                                                // version made by: host byte from the entry options, spec version from the entry
+            cd.extend_from_slice(
+                &((entry.version_made_by & 0xFF00) | version_needed).to_le_bytes(),
+            );
             cd.extend_from_slice(&version_needed.to_le_bytes()); // version needed
-            cd.extend_from_slice(&0u16.to_le_bytes()); // flags
+            cd.extend_from_slice(&crate::format::FLAG_UTF8.to_le_bytes()); // flags
             cd.extend_from_slice(&entry.compression_method.to_le_bytes());
             cd.extend_from_slice(&entry.dos_time.to_le_bytes());
             cd.extend_from_slice(&entry.dos_date.to_le_bytes());
@@ -250,13 +270,14 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
             }
             cd.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
             cd.extend_from_slice(&(extra_cd.len() as u16).to_le_bytes());
-            cd.extend_from_slice(&0u16.to_le_bytes()); // comment len
+            cd.extend_from_slice(&(entry.comment.len() as u16).to_le_bytes()); // comment len
             cd.extend_from_slice(&0u16.to_le_bytes()); // disk start
             cd.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
             cd.extend_from_slice(&entry.external_attrs.to_le_bytes());
             cd.extend_from_slice(&local_offset.to_le_bytes());
             cd.extend_from_slice(&entry.name);
             cd.extend_from_slice(&extra_cd);
+            cd.extend_from_slice(&entry.comment);
 
             self.output.write_all(&cd).await?;
             self.bytes_out += cd.len() as u64;
@@ -307,7 +328,8 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
         eocd.extend_from_slice(&eocd_entry_count.to_le_bytes());
         eocd.extend_from_slice(&eocd_cd_size.to_le_bytes());
         eocd.extend_from_slice(&eocd_cd_offset.to_le_bytes());
-        eocd.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        eocd.extend_from_slice(&(self.comment.len() as u16).to_le_bytes()); // comment len
+        eocd.extend_from_slice(&self.comment);
 
         self.output.write_all(&eocd).await?;
         self.output.flush().await?;

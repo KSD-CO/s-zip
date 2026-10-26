@@ -22,11 +22,15 @@ High-performance streaming ZIP library for Rust backends. Process multi-gigabyte
 - 🚀 **Streaming I/O** - Constant memory regardless of archive size
 - 🔐 **AES-256 Encryption** - WinZip-compatible password protection (sync + async)
 - ⚡ **Async/Await** - Full Tokio support with encryption
-- 🌩️ **Cloud Storage** - Direct streaming to/from S3, GCS, MinIO
+- 🌩️ **Cloud Storage** - Direct streaming to/from S3, GCS, Azure Blob, MinIO
 - 💪 **Parallel Compression** - 2-4x speedup on multi-core CPUs
 - 📦 **ZIP64** - Files >4GB supported
 - 🗜️ **Multiple Codecs** - DEFLATE, Zstd (3x faster compression)
 - 🔌 **Seekless Streaming** - Stream ZIPs to HTTP responses, pipes, any `AsyncWrite` (no `Seek` needed)
+- 📥 **Seekless Reading** - Extract straight from HTTP uploads, pipes or stdin (`ZipStreamReader`)
+- 🛡️ **ZIP Bomb Protection** - Size, ratio and entry-count limits (`ExtractLimits`)
+- 🗂️ **Legacy Archives** - Read ZipCrypto, bzip2, LZMA and XZ entries
+- 🧰 **CLI** - `s-zip pack / unpack / list / test` (`cli` feature)
 
 ## Why s-zip?
 
@@ -42,7 +46,9 @@ cloud object storage without touching local disk.
 | Streaming read (constant memory) | ✅ | Partial (whole entry buffered) | ✅ |
 | AES-256/192/128 encryption (sync + async) | ✅ | ❌ (no built-in AES) | ❌ |
 | Async/Tokio native | ✅ | ❌ | ✅ |
-| Direct S3 / GCS streaming | ✅ | ❌ | ❌ |
+| Direct S3 / GCS / Azure streaming | ✅ | ❌ | ❌ |
+| Read from non-seekable source | ✅ (`ZipStreamReader`) | ✅ (`read::read_zipfile_from_stream`) | ✅ |
+| ZIP bomb limits | ✅ (`ExtractLimits`) | ❌ | ❌ |
 | Parallel multi-file compression | ✅ | ❌ | ❌ |
 | ZIP64 (>4GB) | ✅ | ✅ | ✅ |
 | Zstd codec | ✅ | ✅ | ❌ |
@@ -53,10 +59,10 @@ cloud object storage without touching local disk.
 
 ```toml
 [dependencies]
-s-zip = "0.14"
+s-zip = "0.15"
 
 # With all features
-s-zip = { version = "0.14", features = ["async", "encryption", "async-zstd", "cloud-all"] }
+s-zip = { version = "0.15", features = ["async", "encryption", "async-zstd", "cloud-all"] }
 ```
 
 ### Basic Usage
@@ -92,7 +98,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Cloud Storage (S3/GCS)
+### Untrusted Uploads (no Seek, ZIP bomb limits)
+
+```rust
+use s_zip::{ExtractLimits, ZipStreamReader};
+
+// `body` is any AsyncRead: an HTTP request body, a pipe, stdin...
+let mut zip = ZipStreamReader::new(body);
+zip.set_limits(ExtractLimits::strict());
+while let Some(entry) = zip.next_entry().await? {
+    let data = zip.read_entry_to_end().await?; // CRC-32 verified
+    println!("{}: {} bytes", entry.name, data.len());
+}
+```
+
+`StreamingZipReader` and `GenericAsyncZipReader` accept the same limits via `set_limits()`.
+
+### Cloud Storage (S3/GCS/Azure)
 
 ```rust
 use s_zip::{AsyncStreamingZipWriter, cloud::S3ZipWriter};
@@ -133,36 +155,59 @@ zip.write_data(br#"{"status": "ok"}"#).await?;
 zip.finish().await?;
 ```
 
-## What's New in v0.14.0
+```rust
+use s_zip::{AsyncStreamingZipWriter, cloud::AzureZipWriter};
+use azure_storage_blob::BlobClient;
 
-**Dependency & security refresh** — `cargo audit` is clean with no ignored advisories:
-
-- **Official Google Cloud Storage SDK** — `GCSZipWriter` now uses `google-cloud-storage` 1.x and
-  takes a `google_cloud_storage::client::Storage`. Chunks are streamed via resumable upload as they
-  are produced (no more buffering the whole archive in memory), and dropping the writer before
-  `finish()` aborts the upload instead of committing a truncated object.
-
-- **Leaner AWS TLS stack** — `aws-sdk-s3` drops its legacy hyper 0.14 / rustls 0.21 backend,
-  removing 8 RUSTSEC advisories from the dependency tree.
-
-- **Upgraded crypto stack** — `aes` 0.9, `ctr` 0.10, `hmac` 0.13, `sha1` 0.11, `pbkdf2` 0.13,
-  `getrandom` 0.4; plus `zstd` 0.14. Archives remain fully WinZip AE-2 compatible.
-
-- **Least-privilege CI** — workflow `GITHUB_TOKEN` restricted to `contents: read`.
-
-**Breaking Changes**:
-- `GCSZipWriter::new()` / `builder().client()` take `Storage` instead of the old `Client`
-  (create it with `Storage::builder().build().await?`).
-- S3 Multi-Region Access Points (SigV4a) are no longer supported by the `cloud-s3` feature.
-
-**Migration from v0.13.x**:
-```toml
-s-zip = { version = "0.14", features = ["async", "cloud-gcs"] }
+let blob = BlobClient::new(blob_url, Some(credential), None)?;
+let mut zip = AsyncStreamingZipWriter::from_writer(AzureZipWriter::new(blob.block_blob_client()));
+zip.add_entry("data.json", br#"{"status": "ok"}"#).await?;
+zip.finish().await?;
 ```
 
-**Previously (v0.13.0)**: `extract_all()` with zip-slip protection, recursive `add_directory()`,
-`SECURITY.md`, and `cargo audit` / `cargo deny` in CI. See [CHANGELOG.md](CHANGELOG.md) for the
-full history.
+Readers for all three (`S3ZipReader`, `GCSZipReader`, `AzureZipReader`) plug into
+`GenericAsyncZipReader` and fetch only the byte ranges they need.
+
+### Command Line
+
+```sh
+cargo install s-zip --features cli
+s-zip pack backup.zip ./data --password "$PW" --comment "nightly"
+s-zip list backup.zip
+s-zip test backup.zip
+s-zip unpack backup.zip -d ./restore     # ZIP bomb limits on by default
+```
+
+## What's New in v0.15.0
+
+**Safer reading, more sources and formats, and several interoperability fixes:**
+
+- **`ExtractLimits`** — ZIP bomb protection (per-entry/total size, compression ratio, entry count),
+  enforced on actual decompressed bytes. In-memory reads are now capped at 2 GiB by default.
+- **`ZipStreamReader`** — read archives from non-seekable sources without a temp file.
+- **Azure Blob Storage** (`cloud-azure`) and **`GCSZipReader`** — every cloud backend now has a
+  writer and a reader. Cloud writers apply backpressure (bounded memory) and S3 parts really
+  upload in parallel now.
+- **Legacy formats** — ZipCrypto (`encryption`) and bzip2 / LZMA / XZ (`legacy-codecs`), read-only.
+- **Comments** — archive and entry comments on all writers and readers.
+- **`s-zip` CLI** (`cli` feature).
+
+**Interoperability fixes** (verified with Info-ZIP `unzip`/`zipinfo`):
+- Non-ASCII names now carry the UTF-8 flag (no more garbled names in Windows Explorer).
+- `StreamingZipWriter` entries with `unix_mode` were corrupt; fixed.
+- `AsyncStreamingZipWriter` archives are extractable with `unzip` again (wrong version-needed).
+- Modification times and permissions now reach the central directory.
+
+**Breaking Changes**: `ZipEntry` and `EntryOptions` gained a `comment` field; `SZipError` is
+`#[non_exhaustive]` with a new `LimitExceeded` variant.
+
+**Migration from v0.14.x**:
+```rust
+let opts = EntryOptions { mtime, unix_mode, ..Default::default() };
+```
+
+**Previously (v0.14.0)**: official GCS SDK, leaner AWS TLS stack (clean `cargo audit`), upgraded
+crypto crates.
 
 ## Performance
 
@@ -190,7 +235,10 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 | `zstd-support` | Sync Zstd compression |
 | `cloud-s3` | AWS S3 / MinIO streaming |
 | `cloud-gcs` | Google Cloud Storage streaming |
+| `cloud-azure` | Azure Blob Storage streaming |
 | `cloud-all` | All cloud providers |
+| `legacy-codecs` | Read bzip2 / LZMA / XZ entries |
+| `cli` | `s-zip` command-line tool |
 
 ## Examples
 
@@ -275,7 +323,7 @@ More examples in [examples/](examples/) directory.
 ## Use Cases
 
 - **Web APIs** - Generate ZIPs on-demand (Axum, Actix, Rocket)
-- **Cloud Pipelines** - Stream directly to S3/GCS without local disk
+- **Cloud Pipelines** - Stream directly to S3/GCS/Azure without local disk
 - **Data Exports** - Large dataset exports with encryption
 - **ETL Jobs** - Batch processing with bounded memory
 - **Microservices** - Streaming responses over HTTP
@@ -290,7 +338,9 @@ More examples in [examples/](examples/) directory.
 ## Security
 
 `s-zip` parses untrusted ZIP input and implements AES-256/192/128 + HMAC-SHA1
-encryption (WinZip-compatible). CI runs `cargo audit` and `cargo deny` on every push
+encryption (WinZip-compatible). For archives from untrusted sources, set
+`ExtractLimits::strict()` to guard against ZIP bombs. ZipCrypto is supported for
+reading legacy archives only — it is cryptographically broken and never written. CI runs `cargo audit` and `cargo deny` on every push
 to catch known advisories and license/dependency issues.
 
 Found a vulnerability? **Do not open a public issue** — see [SECURITY.md](SECURITY.md)
@@ -298,7 +348,7 @@ for private reporting instructions, scope, and known limitations.
 
 ## Non-Goals
 
-- Not a CLI tool (use `zip`/`unzip` for that)
+- Not a full replacement for `zip`/`unzip` (the bundled CLI covers the common cases)
 - Not optimized for small files (<1KB)
 - Not focused on desktop/GUI usage
 

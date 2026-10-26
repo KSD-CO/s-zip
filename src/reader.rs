@@ -9,6 +9,7 @@ use crate::format::{
     CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_SIGNATURE, LOCAL_FILE_HEADER_SIGNATURE,
     MAX_ENTRY_ALLOC, ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE,
 };
+use crate::limits::{ExtractLimits, LimitedRead, OutputBudget};
 
 #[cfg(feature = "encryption")]
 use crate::format::parse_aes_extra_field_buf;
@@ -29,6 +30,8 @@ pub struct StreamingZipReader {
     entries: Vec<ZipEntry>,
     #[cfg(feature = "encryption")]
     password: Option<String>,
+    limits: ExtractLimits,
+    comment: String,
 }
 
 impl StreamingZipReader {
@@ -67,14 +70,34 @@ impl StreamingZipReader {
         let mut file = BufReader::with_capacity(buf_size, file);
 
         // Find and read central directory
-        let entries = Self::read_central_directory(&mut file)?;
+        let (entries, comment) = Self::read_central_directory(&mut file)?;
 
         Ok(StreamingZipReader {
             file,
             entries,
             #[cfg(feature = "encryption")]
             password: None,
+            limits: ExtractLimits::default(),
+            comment,
         })
+    }
+
+    /// Set decompression limits (ZIP bomb protection).
+    ///
+    /// Use [`ExtractLimits::strict`] for archives from untrusted sources.
+    pub fn set_limits(&mut self, limits: ExtractLimits) -> &mut Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Get the current decompression limits.
+    pub fn limits(&self) -> &ExtractLimits {
+        &self.limits
+    }
+
+    /// Archive comment from the end-of-central-directory record (empty if none).
+    pub fn comment(&self) -> &str {
+        &self.comment
     }
 
     /// Set password for decrypting encrypted entries
@@ -127,6 +150,8 @@ impl StreamingZipReader {
     /// ```
     pub fn extract_all<P: AsRef<Path>>(&mut self, dest_dir: P) -> Result<()> {
         let dest_dir = dest_dir.as_ref();
+        self.limits.check_entry_count(self.entries.len())?;
+        let mut remaining_total = self.limits.max_total_size;
         let entries = self.entries.clone();
         for entry in &entries {
             let rel_path = entry.safe_path();
@@ -147,7 +172,11 @@ impl StreamingZipReader {
                 std::fs::create_dir_all(parent)?;
             }
 
-            let data = self.read_entry(entry)?;
+            let budget = self.limits.budget(entry, true, remaining_total)?;
+            let data = self.read_entry_with_budget(entry, budget)?;
+            if let Some(rem) = remaining_total.as_mut() {
+                *rem -= data.len() as u64;
+            }
             std::fs::write(&out_path, data)?;
         }
         Ok(())
@@ -155,6 +184,15 @@ impl StreamingZipReader {
 
     /// Read an entry's decompressed data into a vector
     pub fn read_entry(&mut self, entry: &ZipEntry) -> Result<Vec<u8>> {
+        let budget = self.limits.budget(entry, true, None)?;
+        self.read_entry_with_budget(entry, budget)
+    }
+
+    fn read_entry_with_budget(
+        &mut self,
+        entry: &ZipEntry,
+        budget: OutputBudget,
+    ) -> Result<Vec<u8>> {
         // Seek to local file header
         self.file.seek(SeekFrom::Start(entry.offset))?;
 
@@ -176,8 +214,10 @@ impl StreamingZipReader {
         // Read compression method
         let _compression_method = self.read_u16_le()?;
 
-        // Skip modification time and date, CRC-32
-        self.file.seek(SeekFrom::Current(8))?;
+        // Read modification time (ZipCrypto check byte), skip date and CRC-32
+        #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
+        let mod_time = self.read_u16_le()?;
+        self.file.seek(SeekFrom::Current(6))?;
 
         // Read compressed and uncompressed sizes (already known from central directory)
         self.file.seek(SeekFrom::Current(8))?;
@@ -248,6 +288,26 @@ impl StreamingZipReader {
             None
         };
 
+        // Encrypted without an AES extra field: traditional PKWARE (ZipCrypto)
+        #[cfg(feature = "encryption")]
+        let is_zipcrypto = is_encrypted && encryption_info.is_none();
+        #[cfg(feature = "encryption")]
+        if is_zipcrypto {
+            let password = self.password.as_ref().ok_or_else(|| {
+                SZipError::InvalidFormat("Encrypted entry but no password set".to_string())
+            })?;
+            if compressed_data.len() < crate::zipcrypto::HEADER_LEN as usize {
+                return Err(SZipError::InvalidFormat(
+                    "ZipCrypto entry is shorter than its encryption header".to_string(),
+                ));
+            }
+            let header: [u8; 12] = compressed_data[..12].try_into().unwrap();
+            let check = crate::zipcrypto::check_byte(flags, entry.crc32, mod_time);
+            let mut keys = crate::zipcrypto::Keys::from_header(password, &header, check)?;
+            compressed_data.drain(..12);
+            keys.decrypt(&mut compressed_data);
+        }
+
         // Decrypt if encrypted (Step 1: Decrypt compressed data)
         #[cfg(feature = "encryption")]
         let decryptor_opt = if let Some((strength, salt, pw_verify)) = encryption_info {
@@ -269,24 +329,44 @@ impl StreamingZipReader {
         // Decompress if needed (Step 2: Decompress decrypted data)
         let data = if entry.compression_method == 8 {
             // DEFLATE compression
-            let mut decoder = DeflateDecoder::new(&compressed_data[..]);
+            let mut decoder = LimitedRead::new(DeflateDecoder::new(&compressed_data[..]), budget);
             let mut decompressed = Vec::new();
             decoder.read_to_end(&mut decompressed)?;
             decompressed
         } else if entry.compression_method == 0 {
             // No compression (stored)
+            budget.check(compressed_data.len() as u64)?;
             compressed_data
         } else if entry.compression_method == 93 {
             // Zstd compression
             #[cfg(feature = "zstd-support")]
             {
-                zstd::decode_all(&compressed_data[..])?
+                let mut decoder =
+                    LimitedRead::new(zstd::Decoder::new(&compressed_data[..])?, budget);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed)?;
+                decompressed
             }
             #[cfg(not(feature = "zstd-support"))]
             {
                 return Err(SZipError::UnsupportedCompression(entry.compression_method));
             }
         } else {
+            #[cfg(feature = "legacy-codecs")]
+            if crate::legacy::is_legacy_method(entry.compression_method) {
+                let decoder = crate::legacy::decoder(
+                    entry.compression_method,
+                    flags,
+                    entry.uncompressed_size,
+                    &compressed_data[..],
+                )?;
+                let mut decompressed = Vec::new();
+                LimitedRead::new(decoder, budget).read_to_end(&mut decompressed)?;
+                decompressed
+            } else {
+                return Err(SZipError::UnsupportedCompression(entry.compression_method));
+            }
+            #[cfg(not(feature = "legacy-codecs"))]
             return Err(SZipError::UnsupportedCompression(entry.compression_method));
         };
 
@@ -316,8 +396,9 @@ impl StreamingZipReader {
                 )));
             }
         }
+        // ZipCrypto has no MAC, so its CRC must be checked
         #[cfg(feature = "encryption")]
-        if entry.crc32 != 0 && !entry.is_encrypted {
+        if entry.crc32 != 0 && (!entry.is_encrypted || is_zipcrypto) {
             let actual_crc = crc32fast::hash(&data);
             if actual_crc != entry.crc32 {
                 return Err(SZipError::InvalidFormat(format!(
@@ -373,6 +454,16 @@ impl StreamingZipReader {
     /// Returns `SZipError::EncryptionError` if the entry is encrypted but
     /// `set_password()` was not called or the password is wrong.
     pub fn read_entry_streaming(&mut self, entry: &ZipEntry) -> Result<Box<dyn Read + '_>> {
+        let budget = self.limits.budget(entry, false, None)?;
+        let reader = self.read_entry_streaming_raw(entry)?;
+        Ok(if budget.is_unlimited() {
+            reader
+        } else {
+            Box::new(LimitedRead::new(reader, budget))
+        })
+    }
+
+    fn read_entry_streaming_raw(&mut self, entry: &ZipEntry) -> Result<Box<dyn Read + '_>> {
         // Seek to local file header
         self.file.seek(SeekFrom::Start(entry.offset))?;
 
@@ -384,11 +475,15 @@ impl StreamingZipReader {
             ));
         }
 
-        // Skip version, flags, compression method
-        self.file.seek(SeekFrom::Current(6))?;
+        // Skip version; read flags; skip compression method
+        self.file.seek(SeekFrom::Current(2))?;
+        let flags = self.read_u16_le()?;
+        self.file.seek(SeekFrom::Current(2))?;
 
-        // Skip modification time and date, CRC-32
-        self.file.seek(SeekFrom::Current(8))?;
+        // Read modification time (ZipCrypto check byte), skip date and CRC-32
+        #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
+        let mod_time = self.read_u16_le()?;
+        self.file.seek(SeekFrom::Current(6))?;
 
         // Read compressed and uncompressed sizes (use values from central directory)
         self.file.seek(SeekFrom::Current(8))?;
@@ -452,8 +547,19 @@ impl StreamingZipReader {
                     Err(SZipError::UnsupportedCompression(entry.compression_method))
                 };
             } else {
-                // Extra field didn't contain AES info — skip it
-                self.file.seek(SeekFrom::Current(extra_len as i64))?;
+                // No AES extra field: traditional PKWARE (ZipCrypto) encryption.
+                // parse_aes_extra_field() already consumed the extra field.
+                let password = self.password.as_ref().ok_or_else(|| {
+                    SZipError::EncryptionError(
+                        "Encrypted entry but no password set. Call set_password() first."
+                            .to_string(),
+                    )
+                })?;
+                let check = crate::zipcrypto::check_byte(flags, entry.crc32, mod_time);
+                let limited_reader = (&mut self.file).take(entry.compressed_size);
+                let reader =
+                    crate::zipcrypto::ZipCryptoReader::new(limited_reader, password, check)?;
+                return decompressing_reader(entry, flags, reader);
             }
         }
 
@@ -469,26 +575,7 @@ impl StreamingZipReader {
         // Create a reader limited to compressed data size
         let limited_reader = (&mut self.file).take(entry.compressed_size);
 
-        // Wrap with decompressor if needed
-        if entry.compression_method == 8 {
-            // DEFLATE compression
-            Ok(Box::new(DeflateDecoder::new(limited_reader)))
-        } else if entry.compression_method == 0 {
-            // No compression (stored)
-            Ok(Box::new(limited_reader))
-        } else if entry.compression_method == 93 {
-            // Zstd compression
-            #[cfg(feature = "zstd-support")]
-            {
-                Ok(Box::new(zstd::Decoder::new(limited_reader)?))
-            }
-            #[cfg(not(feature = "zstd-support"))]
-            {
-                Err(SZipError::UnsupportedCompression(entry.compression_method))
-            }
-        } else {
-            Err(SZipError::UnsupportedCompression(entry.compression_method))
-        }
+        decompressing_reader(entry, flags, limited_reader)
     }
 
     /// Get a streaming reader for an entry by name
@@ -502,7 +589,7 @@ impl StreamingZipReader {
     }
 
     /// Read the central directory from the ZIP file
-    fn read_central_directory(file: &mut BufReader<File>) -> Result<Vec<ZipEntry>> {
+    fn read_central_directory(file: &mut BufReader<File>) -> Result<(Vec<ZipEntry>, String)> {
         // Find end of central directory record
         let eocd_offset = Self::find_eocd(file)?;
 
@@ -534,6 +621,12 @@ impl StreamingZipReader {
 
         // Read central directory offset (4 bytes)
         let cd_offset_32 = Self::read_u32_le_static(file)? as u64;
+
+        // Archive comment (follows the fixed EOCD fields)
+        let archive_comment_len = Self::read_u16_le_static(file)? as usize;
+        let mut archive_comment = vec![0u8; archive_comment_len];
+        file.read_exact(&mut archive_comment)?;
+        let archive_comment = String::from_utf8_lossy(&archive_comment).into_owned();
 
         // Promote to u64 and handle ZIP64 if markers present
         let mut total_entries = total_entries_16 as usize;
@@ -589,7 +682,7 @@ impl StreamingZipReader {
             // Read filename
             let mut filename_buf = vec![0u8; filename_len];
             file.read_exact(&mut filename_buf)?;
-            let name = String::from_utf8_lossy(&filename_buf).to_string();
+            let name = crate::format::decode_file_name(&filename_buf, flags);
 
             // Read extra field so we can parse ZIP64 extra if present
             let mut extra_buf = vec![0u8; extra_len];
@@ -612,10 +705,9 @@ impl StreamingZipReader {
                 (uncompressed_size_32, compressed_size_32, offset_32)
             };
 
-            // Skip comment
-            if comment_len > 0 {
-                file.seek(SeekFrom::Current(comment_len as i64))?;
-            }
+            let mut comment = vec![0u8; comment_len];
+            file.read_exact(&mut comment)?;
+            let comment = crate::format::decode_file_name(&comment, flags);
 
             entries.push(ZipEntry {
                 name,
@@ -625,10 +717,11 @@ impl StreamingZipReader {
                 offset,
                 crc32,
                 is_encrypted: (flags & 0x01) != 0,
+                comment,
             });
         }
 
-        Ok(entries)
+        Ok((entries, archive_comment))
     }
 
     /// When EOCD indicates ZIP64 usage, find and read ZIP64 EOCD locator and record
@@ -776,5 +869,27 @@ impl StreamingZipReader {
         self.file.read_exact(&mut pw_verify)?;
 
         Ok(Some((strength, salt, pw_verify)))
+    }
+}
+
+/// Wrap the entry's (decrypted) compressed bytes in the matching decompressor.
+fn decompressing_reader<'a, R: Read + Send + 'a>(
+    entry: &ZipEntry,
+    #[cfg_attr(not(feature = "legacy-codecs"), allow(unused_variables))] flags: u16,
+    reader: R,
+) -> Result<Box<dyn Read + 'a>> {
+    match entry.compression_method {
+        0 => Ok(Box::new(reader)),
+        8 => Ok(Box::new(DeflateDecoder::new(reader))),
+        #[cfg(feature = "zstd-support")]
+        93 => Ok(Box::new(zstd::Decoder::new(reader)?)),
+        #[cfg(feature = "legacy-codecs")]
+        m if crate::legacy::is_legacy_method(m) => Ok(crate::legacy::decoder(
+            m,
+            flags,
+            entry.uncompressed_size,
+            reader,
+        )?),
+        m => Err(SZipError::UnsupportedCompression(m)),
     }
 }
