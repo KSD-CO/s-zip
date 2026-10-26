@@ -128,3 +128,139 @@ async fn test_async_ratio_limit_blocks_bomb() {
         .unwrap();
     assert!(matches!(err, SZipError::LimitExceeded(_)));
 }
+
+// ── Entry metadata and comments ──────────────────────────────────────────────
+
+fn options() -> s_zip::EntryOptions {
+    // 2024-05-17 13:45:30 UTC
+    let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_715_953_530);
+    s_zip::EntryOptions {
+        mtime: Some(mtime),
+        unix_mode: Some(0o755),
+        comment: Some("entry note".to_string()),
+    }
+}
+
+/// Check the archive with Info-ZIP: integrity, permissions, date and comments.
+fn check_with_info_zip(path: &std::path::Path) {
+    let Ok(test) = std::process::Command::new("unzip")
+        .arg("-t")
+        .arg(path)
+        .output()
+    else {
+        eprintln!("unzip not installed; skipping");
+        return;
+    };
+    assert!(
+        test.status.success(),
+        "{}",
+        String::from_utf8_lossy(&test.stdout)
+    );
+
+    let info = std::process::Command::new("zipinfo")
+        .arg(path)
+        .output()
+        .unwrap();
+    let info = String::from_utf8_lossy(&info.stdout);
+    assert!(info.contains("-rwxr-xr-x"), "{info}");
+    assert!(info.contains("unx"), "{info}");
+    assert!(info.contains("24-May-17 13:45"), "{info}");
+
+    let comments = std::process::Command::new("unzip")
+        .arg("-z")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&comments.stdout).contains("archive note"));
+}
+
+fn check_with_reader(path: &std::path::Path) {
+    let mut reader = StreamingZipReader::open(path).unwrap();
+    assert_eq!(reader.comment(), "archive note");
+    assert_eq!(reader.entries()[0].comment, "entry note");
+    assert_eq!(
+        reader.read_entry_by_name("run.sh").unwrap(),
+        b"#!/bin/sh\necho hi\n"
+    );
+}
+
+#[test]
+fn test_sync_writer_metadata_and_comments() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut writer = StreamingZipWriter::new(tmp.path()).unwrap();
+    writer.set_comment("archive note").unwrap();
+    writer
+        .start_entry_with_options("run.sh", options())
+        .unwrap();
+    writer.write_data(b"#!/bin/sh\necho hi\n").unwrap();
+    writer.finish().unwrap();
+    check_with_info_zip(tmp.path());
+    check_with_reader(tmp.path());
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn test_sync_writer_unix_mode_with_encryption() {
+    // The AES salt must come after the whole extra field (Unix extra included)
+    let tmp = NamedTempFile::new().unwrap();
+    let mut writer = StreamingZipWriter::new(tmp.path()).unwrap();
+    writer.set_password("pw");
+    writer
+        .start_entry_with_options("run.sh", options())
+        .unwrap();
+    writer.write_data(b"secret").unwrap();
+    writer.finish().unwrap();
+    let mut reader = StreamingZipReader::open(tmp.path()).unwrap();
+    reader.set_password("pw");
+    assert_eq!(reader.read_entry_by_name("run.sh").unwrap(), b"secret");
+}
+
+#[test]
+fn test_comment_too_long_rejected() {
+    let mut writer = StreamingZipWriter::from_writer(std::io::Cursor::new(Vec::new())).unwrap();
+    assert!(writer.set_comment("x".repeat(70_000)).is_err());
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn test_async_writer_metadata_and_comments() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut writer = s_zip::AsyncStreamingZipWriter::new(tmp.path())
+        .await
+        .unwrap();
+    writer.set_comment("archive note").unwrap();
+    writer
+        .start_entry_with_options("run.sh", options())
+        .await
+        .unwrap();
+    writer.write_data(b"#!/bin/sh\necho hi\n").await.unwrap();
+    writer.finish().await.unwrap();
+    check_with_info_zip(tmp.path());
+    check_with_reader(tmp.path());
+
+    let mut reader = s_zip::AsyncStreamingZipReader::open(tmp.path())
+        .await
+        .unwrap();
+    assert_eq!(reader.comment(), "archive note");
+    assert_eq!(reader.entries()[0].comment, "entry note");
+    assert_eq!(
+        reader.read_entry_by_name("run.sh").await.unwrap(),
+        b"#!/bin/sh\necho hi\n"
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn test_seekless_writer_metadata_and_comments() {
+    let tmp = NamedTempFile::new().unwrap();
+    let file = tokio::fs::File::create(tmp.path()).await.unwrap();
+    let mut writer = s_zip::SeeklessZipWriter::new(file);
+    writer.set_comment("archive note").unwrap();
+    writer
+        .add_entry_with_options("run.sh", b"#!/bin/sh\necho hi\n", options())
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+    check_with_info_zip(tmp.path());
+    check_with_reader(tmp.path());
+}

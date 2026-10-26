@@ -32,6 +32,7 @@ pub struct GenericAsyncZipReader<R: AsyncRead + AsyncSeek + Unpin + Send> {
     #[cfg(feature = "encryption")]
     password: Option<String>,
     limits: ExtractLimits,
+    comment: String,
 }
 
 /// Type alias for file-based async ZIP reader (convenience)
@@ -221,7 +222,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         let mut reader = BufReader::with_capacity(buf_size, reader);
 
         // Find and read central directory
-        let entries = Self::read_central_directory(&mut reader).await?;
+        let (entries, comment) = Self::read_central_directory(&mut reader).await?;
 
         Ok(GenericAsyncZipReader {
             reader,
@@ -229,6 +230,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
             #[cfg(feature = "encryption")]
             password: None,
             limits: ExtractLimits::default(),
+            comment,
         })
     }
 
@@ -243,6 +245,11 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
     /// Get the current decompression limits.
     pub fn limits(&self) -> &ExtractLimits {
         &self.limits
+    }
+
+    /// Archive comment from the end-of-central-directory record (empty if none).
+    pub fn comment(&self) -> &str {
+        &self.comment
     }
 
     /// Get list of all entries in the ZIP
@@ -679,7 +686,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
     }
 
     /// Read the central directory from the ZIP file
-    async fn read_central_directory(reader: &mut BufReader<R>) -> Result<Vec<ZipEntry>> {
+    async fn read_central_directory(reader: &mut BufReader<R>) -> Result<(Vec<ZipEntry>, String)> {
         // Find end of central directory record
         let eocd_offset = Self::find_eocd(reader).await?;
 
@@ -710,6 +717,12 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
 
         // Read central directory offset (4 bytes)
         let cd_offset_32 = Self::read_u32_le_static(reader).await? as u64;
+
+        // Archive comment (follows the fixed EOCD fields)
+        let archive_comment_len = Self::read_u16_le_static(reader).await? as usize;
+        let mut archive_comment = vec![0u8; archive_comment_len];
+        reader.read_exact(&mut archive_comment).await?;
+        let archive_comment = String::from_utf8_lossy(&archive_comment).into_owned();
 
         // Promote to u64 and handle ZIP64 if markers present
         let mut total_entries = total_entries_16 as usize;
@@ -786,10 +799,9 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
                 (uncompressed_size_32, compressed_size_32, offset_32)
             };
 
-            // Skip comment
-            if comment_len > 0 {
-                reader.seek(SeekFrom::Current(comment_len as i64)).await?;
-            }
+            let mut comment = vec![0u8; comment_len];
+            reader.read_exact(&mut comment).await?;
+            let comment = crate::format::decode_file_name(&comment, flags);
 
             entries.push(ZipEntry {
                 name,
@@ -799,10 +811,11 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
                 offset,
                 crc32,
                 is_encrypted,
+                comment,
             });
         }
 
-        Ok(entries)
+        Ok((entries, archive_comment))
     }
 
     /// When EOCD indicates ZIP64 usage, find and read ZIP64 EOCD locator and record

@@ -35,6 +35,7 @@ struct ZipEntry {
     compression_method: u16,
     #[cfg(feature = "encryption")]
     encryption_strength: Option<u16>,
+    meta: crate::EntryMeta,
 }
 
 /// Async streaming ZIP writer that compresses data on-the-fly
@@ -48,6 +49,8 @@ pub struct AsyncStreamingZipWriter<W: AsyncWrite + AsyncSeek + Unpin> {
     password: Option<String>,
     #[cfg(feature = "encryption")]
     encryption_strength: AesStrength,
+    /// Archive comment written after the end-of-central-directory record
+    comment: Vec<u8>,
 }
 
 struct CurrentEntry {
@@ -58,6 +61,7 @@ struct CurrentEntry {
     compression_method: u16,
     #[cfg(feature = "encryption")]
     encryptor: Option<AesEncryptor>,
+    meta: crate::EntryMeta,
 }
 
 /// Trait for async compression encoders
@@ -285,6 +289,7 @@ impl AsyncStreamingZipWriter<tokio::fs::File> {
             password: None,
             #[cfg(feature = "encryption")]
             encryption_strength: AesStrength::Aes256,
+            comment: Vec::new(),
         })
     }
 
@@ -302,6 +307,7 @@ impl AsyncStreamingZipWriter<tokio::fs::File> {
             password: None,
             #[cfg(feature = "encryption")]
             encryption_strength: AesStrength::Aes256,
+            comment: Vec::new(),
         })
     }
 }
@@ -374,6 +380,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             password: None,
             #[cfg(feature = "encryption")]
             encryption_strength: AesStrength::Aes256,
+            comment: Vec::new(),
         }
     }
 
@@ -413,6 +420,41 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
     pub fn clear_password(&mut self) -> &mut Self {
         self.password = None;
         self
+    }
+
+    /// Set the archive comment (at most 65 535 bytes), written by `finish()`.
+    pub fn set_comment(&mut self, comment: impl Into<String>) -> Result<&mut Self> {
+        let comment = comment.into().into_bytes();
+        crate::check_comment_len(&comment)?;
+        self.comment = comment;
+        Ok(self)
+    }
+
+    /// Start a new entry with metadata (modification time, Unix permissions, comment).
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use s_zip::{AsyncStreamingZipWriter, EntryOptions};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut writer = AsyncStreamingZipWriter::new("output.zip").await?;
+    /// let opts = EntryOptions {
+    ///     mtime: Some(std::time::SystemTime::now()),
+    ///     unix_mode: Some(0o755),
+    ///     comment: Some("build script".to_string()),
+    /// };
+    /// writer.start_entry_with_options("build.sh", opts).await?;
+    /// writer.write_data(b"#!/bin/sh").await?;
+    /// writer.finish().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn start_entry_with_options(
+        &mut self,
+        name: &str,
+        options: crate::EntryOptions,
+    ) -> Result<()> {
+        self.start_entry_with_options_and_hint(name, options, None)
+            .await
     }
 
     /// Start a new entry (file) in the ZIP
@@ -547,6 +589,18 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         name: &str,
         size_hint: Option<u64>,
     ) -> Result<()> {
+        self.start_entry_with_options_and_hint(name, crate::EntryOptions::default(), size_hint)
+            .await
+    }
+
+    async fn start_entry_with_options_and_hint(
+        &mut self,
+        name: &str,
+        options: crate::EntryOptions,
+        size_hint: Option<u64>,
+    ) -> Result<()> {
+        let meta = options.meta()?;
+
         // Finish previous entry if any
         self.finish_current_entry().await?;
 
@@ -567,14 +621,20 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
 
         // Write local file header with data descriptor flag (bit 3) + encryption flag (bit 0)
         self.output.write_all(&[0x50, 0x4b, 0x03, 0x04]).await?; // signature
-        self.output.write_all(&[51, 0]).await?; // version needed (5.1 for AES)
+                                                                 // version needed: 5.1 for AES, otherwise 2.0
+        #[cfg(feature = "encryption")]
+        let version_needed: u16 = if encryptor.is_some() { 51 } else { 20 };
+        #[cfg(not(feature = "encryption"))]
+        let version_needed: u16 = 20;
+        self.output.write_all(&version_needed.to_le_bytes()).await?;
         self.output
             .write_all(&[8 | encryption_flag, crate::format::FLAG_UTF8_HI])
             .await?; // general purpose bit flag
         self.output
             .write_all(&compression_method.to_le_bytes())
             .await?; // compression method
-        self.output.write_all(&[0, 0, 0, 0]).await?; // mod time/date
+        self.output.write_all(&meta.dos_time.to_le_bytes()).await?;
+        self.output.write_all(&meta.dos_date.to_le_bytes()).await?;
         self.output.write_all(&0u32.to_le_bytes()).await?; // crc32 placeholder
         self.output.write_all(&0u32.to_le_bytes()).await?; // compressed size placeholder
         self.output.write_all(&0u32.to_le_bytes()).await?; // uncompressed size placeholder
@@ -584,9 +644,9 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
 
         // Calculate extra field size for AES
         #[cfg(feature = "encryption")]
-        let extra_len = if encryptor.is_some() { 11 } else { 0 };
+        let extra_len = if encryptor.is_some() { 11 } else { 0 } + meta.unix_extra.len();
         #[cfg(not(feature = "encryption"))]
-        let extra_len = 0;
+        let extra_len = meta.unix_extra.len();
 
         self.output
             .write_all(&(extra_len as u16).to_le_bytes())
@@ -609,8 +669,14 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             self.output
                 .write_all(&compression_method.to_le_bytes())
                 .await?; // actual compression (2 bytes)
+        }
 
-            // Write salt and password verification
+        // Unix extra field (counted in extra_len above)
+        self.output.write_all(&meta.unix_extra).await?;
+
+        // Salt and password verification follow the extra field
+        #[cfg(feature = "encryption")]
+        if let Some(ref enc) = encryptor {
             self.output.write_all(enc.salt()).await?;
             self.output.write_all(enc.password_verify()).await?;
         }
@@ -672,6 +738,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             compression_method,
             #[cfg(feature = "encryption")]
             encryptor,
+            meta,
         });
 
         Ok(())
@@ -801,6 +868,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 compression_method: entry.compression_method,
                 #[cfg(feature = "encryption")]
                 encryption_strength: encryption_strength_code,
+                meta: entry.meta,
             });
         }
         Ok(())
@@ -925,6 +993,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 compression_method: 8, // DEFLATE
                 #[cfg(feature = "encryption")]
                 encryption_strength: None, // Parallel compression doesn't support encryption yet
+                meta: crate::EntryMeta::plain(),
             });
         }
 
@@ -942,8 +1011,12 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         // Write central directory
         for entry in &self.entries {
             self.output.write_all(&[0x50, 0x4b, 0x01, 0x02]).await?; // central dir sig
-            self.output.write_all(&[20, 0]).await?; // version made by
-            self.output.write_all(&[51, 0]).await?; // version needed (5.1 for AES)
+            self.output
+                .write_all(&entry.meta.version_made_by.to_le_bytes())
+                .await?; // version made by
+            self.output
+                .write_all(&cd_version_needed(entry).to_le_bytes())
+                .await?; // version needed
 
             // general purpose bit flag: bit 3 for data descriptor + bit 0 for encryption
             #[cfg(feature = "encryption")]
@@ -961,7 +1034,12 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             self.output
                 .write_all(&entry.compression_method.to_le_bytes())
                 .await?; // compression method
-            self.output.write_all(&[0, 0, 0, 0]).await?; // mod time/date
+            self.output
+                .write_all(&entry.meta.dos_time.to_le_bytes())
+                .await?;
+            self.output
+                .write_all(&entry.meta.dos_date.to_le_bytes())
+                .await?;
             self.output.write_all(&entry.crc32.to_le_bytes()).await?;
 
             // Write sizes (32-bit placeholders or actual values)
@@ -986,7 +1064,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 .await?;
 
             // Prepare extra fields
-            let mut extra_field: Vec<u8> = Vec::new();
+            let mut extra_field: Vec<u8> = entry.meta.unix_extra.clone();
 
             // Add AES extra field if entry was encrypted
             #[cfg(feature = "encryption")]
@@ -1025,10 +1103,14 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             self.output
                 .write_all(&(extra_field.len() as u16).to_le_bytes())
                 .await?; // extra len
-            self.output.write_all(&0u16.to_le_bytes()).await?; // file comment len
+            self.output
+                .write_all(&(entry.meta.comment.len() as u16).to_le_bytes())
+                .await?; // file comment len
             self.output.write_all(&0u16.to_le_bytes()).await?; // disk number start
             self.output.write_all(&0u16.to_le_bytes()).await?; // internal attrs
-            self.output.write_all(&0u32.to_le_bytes()).await?; // external attrs
+            self.output
+                .write_all(&entry.meta.external_attrs.to_le_bytes())
+                .await?; // external attrs
 
             // local header offset (32-bit or 0xFFFFFFFF)
             if entry.local_header_offset > u32::MAX as u64 {
@@ -1043,6 +1125,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             if !extra_field.is_empty() {
                 self.output.write_all(&extra_field).await?;
             }
+            self.output.write_all(&entry.meta.comment).await?;
         }
 
         let central_dir_size = self.output.stream_position().await? - central_dir_offset;
@@ -1059,8 +1142,8 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             self.output
                 .write_all(&zip64_eocd_size.to_le_bytes())
                 .await?;
-            self.output.write_all(&[20, 0]).await?;
-            self.output.write_all(&[20, 0]).await?;
+            self.output.write_all(&[45, 0]).await?; // ZIP64 EOCD: version 4.5
+            self.output.write_all(&[45, 0]).await?;
             self.output.write_all(&0u32.to_le_bytes()).await?;
             self.output.write_all(&0u32.to_le_bytes()).await?;
             self.output
@@ -1119,7 +1202,10 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 .await?;
         }
 
-        self.output.write_all(&0u16.to_le_bytes()).await?; // comment len
+        self.output
+            .write_all(&(self.comment.len() as u16).to_le_bytes())
+            .await?; // comment len
+        self.output.write_all(&self.comment).await?;
 
         // CRITICAL: Must call shutdown() to ensure cloud uploads complete
         // For cloud writers like S3ZipWriter, shutdown() completes the multipart upload
@@ -1176,5 +1262,22 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                 encrypted,
             },
         ))
+    }
+}
+
+/// Central directory "version needed": 5.1 for AES, 4.5 for ZIP64, else 2.0.
+/// Info-ZIP `unzip` refuses entries that claim a newer version than needed.
+fn cd_version_needed(entry: &ZipEntry) -> u16 {
+    #[cfg(feature = "encryption")]
+    if entry.encryption_strength.is_some() {
+        return 51;
+    }
+    if entry.compressed_size > u32::MAX as u64
+        || entry.uncompressed_size > u32::MAX as u64
+        || entry.local_header_offset > u32::MAX as u64
+    {
+        45
+    } else {
+        20
     }
 }

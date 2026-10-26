@@ -93,6 +93,8 @@ pub struct ZipEntry {
     /// `#[cfg(feature = "encryption")]` at the usage sites; the async reader
     /// always exposes it.
     pub is_encrypted: bool,
+    /// Entry comment from the central directory (empty if none).
+    pub comment: String,
 }
 
 impl ZipEntry {
@@ -336,6 +338,7 @@ mod tests {
             offset: 0,
             crc32: 0,
             is_encrypted: false,
+            comment: String::new(),
         };
         let p = entry.safe_path();
         assert_eq!(p, PathBuf::from("etc/passwd"));

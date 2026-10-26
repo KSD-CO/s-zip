@@ -31,6 +31,7 @@ pub struct StreamingZipReader {
     #[cfg(feature = "encryption")]
     password: Option<String>,
     limits: ExtractLimits,
+    comment: String,
 }
 
 impl StreamingZipReader {
@@ -69,7 +70,7 @@ impl StreamingZipReader {
         let mut file = BufReader::with_capacity(buf_size, file);
 
         // Find and read central directory
-        let entries = Self::read_central_directory(&mut file)?;
+        let (entries, comment) = Self::read_central_directory(&mut file)?;
 
         Ok(StreamingZipReader {
             file,
@@ -77,6 +78,7 @@ impl StreamingZipReader {
             #[cfg(feature = "encryption")]
             password: None,
             limits: ExtractLimits::default(),
+            comment,
         })
     }
 
@@ -91,6 +93,11 @@ impl StreamingZipReader {
     /// Get the current decompression limits.
     pub fn limits(&self) -> &ExtractLimits {
         &self.limits
+    }
+
+    /// Archive comment from the end-of-central-directory record (empty if none).
+    pub fn comment(&self) -> &str {
+        &self.comment
     }
 
     /// Set password for decrypting encrypted entries
@@ -582,7 +589,7 @@ impl StreamingZipReader {
     }
 
     /// Read the central directory from the ZIP file
-    fn read_central_directory(file: &mut BufReader<File>) -> Result<Vec<ZipEntry>> {
+    fn read_central_directory(file: &mut BufReader<File>) -> Result<(Vec<ZipEntry>, String)> {
         // Find end of central directory record
         let eocd_offset = Self::find_eocd(file)?;
 
@@ -614,6 +621,12 @@ impl StreamingZipReader {
 
         // Read central directory offset (4 bytes)
         let cd_offset_32 = Self::read_u32_le_static(file)? as u64;
+
+        // Archive comment (follows the fixed EOCD fields)
+        let archive_comment_len = Self::read_u16_le_static(file)? as usize;
+        let mut archive_comment = vec![0u8; archive_comment_len];
+        file.read_exact(&mut archive_comment)?;
+        let archive_comment = String::from_utf8_lossy(&archive_comment).into_owned();
 
         // Promote to u64 and handle ZIP64 if markers present
         let mut total_entries = total_entries_16 as usize;
@@ -692,10 +705,9 @@ impl StreamingZipReader {
                 (uncompressed_size_32, compressed_size_32, offset_32)
             };
 
-            // Skip comment
-            if comment_len > 0 {
-                file.seek(SeekFrom::Current(comment_len as i64))?;
-            }
+            let mut comment = vec![0u8; comment_len];
+            file.read_exact(&mut comment)?;
+            let comment = crate::format::decode_file_name(&comment, flags);
 
             entries.push(ZipEntry {
                 name,
@@ -705,10 +717,11 @@ impl StreamingZipReader {
                 offset,
                 crc32,
                 is_encrypted: (flags & 0x01) != 0,
+                comment,
             });
         }
 
-        Ok(entries)
+        Ok((entries, archive_comment))
     }
 
     /// When EOCD indicates ZIP64 usage, find and read ZIP64 EOCD locator and record

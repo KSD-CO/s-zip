@@ -222,6 +222,7 @@ mod tests {
             offset: 0,
             crc32: 0,
             is_encrypted: false,
+            comment: String::new(),
         }
     }
 

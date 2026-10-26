@@ -219,6 +219,7 @@ impl<R: AsyncRead + Unpin + Send> ZipStreamReader<R> {
             offset: header_offset,
             crc32,
             is_encrypted: false,
+            comment: String::new(),
         };
         let budget = self.limits.budget(&entry, false, self.remaining_total)?;
 
