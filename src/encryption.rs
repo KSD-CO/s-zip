@@ -280,10 +280,10 @@ impl AesDecryptor {
 /// `AesDecryptor::decrypt()` — AES-CTR encryption and decryption are
 /// identical operations.
 fn apply_ctr_keystream(strength: AesStrength, key: &[u8], byte_offset: u64, data: &mut [u8]) {
-    // CTR block counter: stored in the upper 64 bits of the 128-bit IV.
+    // CTR block counter: the 128-bit big-endian IV is the block number itself
+    // (low 64 bits). Uniqueness comes from the per-entry key derived from a random salt.
     let block_number = byte_offset / 16;
-    let mut iv = [0u8; 16];
-    iv[8..16].copy_from_slice(&block_number.to_be_bytes());
+    let iv = u128::from(block_number).to_be_bytes();
 
     // Partial-block alignment: fast-forward past bytes already consumed
     // within the current block.

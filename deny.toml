@@ -8,16 +8,6 @@ targets = []
 [advisories]
 version = 2
 yanked = "deny"
-# RUSTSEC-2026-0258 (h2), RUSTSEC-2026-0104/0098/0099 (rustls-webpki): transitive via
-# aws-smithy-http-client's legacy hyper 0.14 / rustls 0.21 TLS backend, pulled in by
-# aws-config/aws-sdk-s3 (cloud-s3 feature). Not resolvable via `cargo update` — upstream
-# pins that backend version. Re-check when bumping aws-sdk-s3/aws-config in Cargo.toml.
-ignore = [
-    "RUSTSEC-2026-0258",
-    "RUSTSEC-2026-0104",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-]
 
 [licenses]
 version = 2

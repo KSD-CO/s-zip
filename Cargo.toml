@@ -32,7 +32,7 @@ pin-project-lite = { version = "0.2", optional = true }
 # Optional tracing support
 tracing = { version = "0.1", optional = true }
 aws-config = { version = "1.5", optional = true, features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.80", optional = true, features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.80", optional = true, default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "http-1x"] }
 google-cloud-storage = { version = "0.22", optional = true }
 google-cloud-auth = { version = "0.17", optional = true }
 

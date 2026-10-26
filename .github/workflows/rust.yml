@@ -8,6 +8,9 @@ on:
   pull_request:
     branches: [ "master" ]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -89,17 +92,8 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      # RUSTSEC-2026-0258 (h2), RUSTSEC-2026-0104/0098/0099 (rustls-webpki) come from
-      # aws-smithy-http-client's legacy hyper 0.14 / rustls 0.21 TLS backend, pulled in
-      # transitively by aws-config/aws-sdk-s3 (cloud-s3 feature). Not fixable via `cargo
-      # update` — upstream pins that backend. Re-check when bumping aws-sdk-s3/aws-config.
       - name: Audit dependencies (RUSTSEC advisories)
-        run: |
-          cargo audit \
-            --ignore RUSTSEC-2026-0258 \
-            --ignore RUSTSEC-2026-0104 \
-            --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099
+        run: cargo audit
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
