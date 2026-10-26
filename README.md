@@ -53,10 +53,10 @@ cloud object storage without touching local disk.
 
 ```toml
 [dependencies]
-s-zip = "0.13"
+s-zip = "0.14"
 
 # With all features
-s-zip = { version = "0.13", features = ["async", "encryption", "async-zstd", "cloud-all"] }
+s-zip = { version = "0.14", features = ["async", "encryption", "async-zstd", "cloud-all"] }
 ```
 
 ### Basic Usage
@@ -114,52 +114,55 @@ zip.write_data(br#"{"status": "ok"}"#).await?;
 zip.finish().await?;
 ```
 
-## What's New in v0.13.0
+```rust
+use s_zip::{AsyncStreamingZipWriter, cloud::GCSZipWriter};
+use google_cloud_storage::client::Storage;
 
-**Security hardening + convenience methods** — directory/archive helpers and CI security scanning:
+let gcs_client = Storage::builder().build().await?;
 
-- **`extract_all()`** on `StreamingZipReader` and `AsyncStreamingZipReader` — extract an entire archive
-  to a destination directory in one call, with zip-slip protection via `safe_path()` and full
-  CRC/HMAC verification per entry.
+let writer = GCSZipWriter::builder()
+    .client(gcs_client)
+    .bucket("my-bucket")
+    .object("archive.zip")
+    .build()
+    .await?;
 
-- **`add_directory()`** on `StreamingZipWriter` and `AsyncStreamingZipWriter<W>` — recursively add a
-  whole directory tree to an archive in one call, preserving relative paths.
-
-- **`SECURITY.md`** — vulnerability disclosure policy, scope, and known limitations.
-
-- **CI security scanning** — `cargo audit` and `cargo deny` now run on every push/PR (`rust.yml`),
-  enforced via `deny.toml` (license allow-list, advisory checks, banned sources).
-
-**Previously (v0.12.0)**: seekless streaming, AES-128/192, parallel extraction, stats API, and
-convenience methods:
-
-- **`SeeklessZipWriter`** — stream ZIPs to HTTP response bodies, pipes, or any `AsyncWrite` without `Seek`.
-  Pre-compresses each entry; peak RAM ≈ compressed entry size (negligible for compressible data).
-
-- **`read_entries_parallel()`** on `AsyncStreamingZipReader` — extract multiple named entries concurrently
-  with a bounded semaphore. Missing names are silently skipped.
-
-- **AES-128 / AES-192** — `AesStrength::Aes128` and `AesStrength::Aes192` now fully functional
-  alongside the existing `Aes256`.
-
-- **`finish_with_stats()`** — returns `ZipStats` (entry count, compressed/uncompressed bytes,
-  compression ratio, encrypted flag) as a non-breaking additive method on both sync and async writers.
-
-- **`add_entry()`** one-liner — `writer.add_entry("name", data)?` on all three writer types.
-
-- **`entry_count()` / `bytes_written()`** accessors on all writer types for progress reporting.
-
-- **`estimated_peak_memory_mb()` fix** — updated from stale `4 MB/task` to accurate `1 MB/task`
-  after the v0.11.3 `CrcReader` streaming pipeline. Measured: **4.6 MB peak** for 8 threads × 5 MB files.
-
-**Breaking Changes**: None.
-
-**Migration from v0.11.x**:
-```toml
-s-zip = { version = "0.12", features = ["async", "encryption"] }
+let mut zip = AsyncStreamingZipWriter::from_writer(writer);
+zip.start_entry("data.json").await?;
+zip.write_data(br#"{"status": "ok"}"#).await?;
+zip.finish().await?;
 ```
 
+## What's New in v0.14.0
 
+**Dependency & security refresh** — `cargo audit` is clean with no ignored advisories:
+
+- **Official Google Cloud Storage SDK** — `GCSZipWriter` now uses `google-cloud-storage` 1.x and
+  takes a `google_cloud_storage::client::Storage`. Chunks are streamed via resumable upload as they
+  are produced (no more buffering the whole archive in memory), and dropping the writer before
+  `finish()` aborts the upload instead of committing a truncated object.
+
+- **Leaner AWS TLS stack** — `aws-sdk-s3` drops its legacy hyper 0.14 / rustls 0.21 backend,
+  removing 8 RUSTSEC advisories from the dependency tree.
+
+- **Upgraded crypto stack** — `aes` 0.9, `ctr` 0.10, `hmac` 0.13, `sha1` 0.11, `pbkdf2` 0.13,
+  `getrandom` 0.4; plus `zstd` 0.14. Archives remain fully WinZip AE-2 compatible.
+
+- **Least-privilege CI** — workflow `GITHUB_TOKEN` restricted to `contents: read`.
+
+**Breaking Changes**:
+- `GCSZipWriter::new()` / `builder().client()` take `Storage` instead of the old `Client`
+  (create it with `Storage::builder().build().await?`).
+- S3 Multi-Region Access Points (SigV4a) are no longer supported by the `cloud-s3` feature.
+
+**Migration from v0.13.x**:
+```toml
+s-zip = { version = "0.14", features = ["async", "cloud-gcs"] }
+```
+
+**Previously (v0.13.0)**: `extract_all()` with zip-slip protection, recursive `add_directory()`,
+`SECURITY.md`, and `cargo audit` / `cargo deny` in CI. See [CHANGELOG.md](CHANGELOG.md) for the
+full history.
 
 ## Performance
 
