@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use s_zip::StreamingZipWriter;
+use std::hint::black_box;
 use std::io::Cursor;
 
 fn generate_data(size: usize) -> Vec<u8> {
