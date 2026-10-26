@@ -25,6 +25,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`s-zip` CLI** (`cli` feature) — `pack`, `unpack`, `list`, `test`.
 - Cloud end-to-end tests against s3mock / Azurite / fake-gcs-server, run in CI.
 
+### Performance ⚡
+
+Measured with criterion against v0.14.0 on the same machine:
+
+- Opening an archive with 20 000 entries: **592 ms → 1.4 ms** (sync), **2.07 s → 2.7 ms** (async).
+  Relative `seek`s on `BufReader` discarded the buffer and refilled up to 512 KB / 1 MB for every
+  header field; readers now skip within the buffer.
+- Reading many small entries: 30–54 % faster (sync), 74 % faster (async). Reading incompressible
+  data: ~25 % faster.
+- Writing many entries: 61–78 % faster. Local headers, data descriptors and central directory
+  records are assembled in memory and written with one call instead of ~40 small writes.
+- **Peak memory when writing large entries no longer grows with the data written**: writing a
+  200 MiB entry peaked at 88–122 MiB RSS (deflate/store, sync and async); it now stays at ~16 MiB.
+  The compressed-data buffer was taken (dropping its capacity) and regrown from zero on every
+  flush; it is now written and cleared in place.
+- Writers keep per-entry metadata only for entries that have any, so the new metadata support
+  adds no memory for plain entries.
+- Large single-entry reads/writes and encryption: unchanged.
+
 ### Fixed 🐛
 
 - Non-ASCII entry names were written without the UTF-8 flag (garbled in Windows Explorer and

@@ -289,14 +289,27 @@ pub(crate) struct EntryMeta {
     pub(crate) comment: Vec<u8>,
 }
 
+/// Metadata of entries written without `EntryOptions` (no time, attributes or comment).
+pub(crate) static PLAIN_META: EntryMeta = EntryMeta {
+    dos_time: 0,
+    dos_date: 0,
+    external_attrs: 0,
+    version_made_by: 20,
+    unix_extra: Vec::new(),
+    comment: Vec::new(),
+};
+
 impl EntryMeta {
-    /// Metadata for entries written without `EntryOptions`.
-    #[cfg(feature = "async")]
-    pub(crate) fn plain() -> Self {
-        Self {
-            version_made_by: 20,
-            ..Self::default()
-        }
+    /// Box the metadata for storage until `finish()`, or `None` when it is
+    /// [`PLAIN_META`], so archives with many plain entries stay small in memory.
+    pub(crate) fn boxed_if_custom(self) -> Option<Box<Self>> {
+        let plain = self.dos_time == 0
+            && self.dos_date == 0
+            && self.external_attrs == 0
+            && self.version_made_by == PLAIN_META.version_made_by
+            && self.unix_extra.is_empty()
+            && self.comment.is_empty();
+        (!plain).then(|| Box::new(self))
     }
 }
 

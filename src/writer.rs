@@ -54,7 +54,8 @@ struct ZipEntry {
     #[cfg(feature = "encryption")]
     #[allow(dead_code)] // Will be used for central directory in future versions
     encryption_strength: Option<u16>,
-    meta: crate::EntryMeta,
+    /// `None` for entries without custom metadata (see `PLAIN_META`)
+    meta: Option<Box<crate::EntryMeta>>,
 }
 
 /// Streaming ZIP writer that compresses data on-the-fly
@@ -572,26 +573,27 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         #[cfg(not(feature = "encryption"))]
         let encryption_flag = 0x00;
 
+        // Assemble the local header in memory and write it with one call
+        let mut header = Vec::with_capacity(128 + name.len());
         // Write local file header with data descriptor flag (bit 3) + encryption flag (bit 0)
-        self.output.write_all(&[0x50, 0x4b, 0x03, 0x04])?; // signature
-                                                           // version needed: 5.1 for AES, otherwise 2.0
+        header.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]); // signature
+                                                             // version needed: 5.1 for AES, otherwise 2.0
         #[cfg(feature = "encryption")]
         let version_needed: u16 = if encryptor.is_some() { 51 } else { 20 };
         #[cfg(not(feature = "encryption"))]
         let version_needed: u16 = 20;
-        self.output.write_all(&version_needed.to_le_bytes())?;
-        self.output
-            .write_all(&[8 | encryption_flag, crate::format::FLAG_UTF8_HI])?; // general purpose bit flag
-        self.output.write_all(&compression_method.to_le_bytes())?; // compression method
+        header.extend_from_slice(&version_needed.to_le_bytes());
+        header.extend_from_slice(&[8 | encryption_flag, crate::format::FLAG_UTF8_HI]); // general purpose bit flag
+        header.extend_from_slice(&compression_method.to_le_bytes()); // compression method
 
         // MS-DOS timestamp (time, date)
-        self.output.write_all(&meta.dos_time.to_le_bytes())?;
-        self.output.write_all(&meta.dos_date.to_le_bytes())?;
+        header.extend_from_slice(&meta.dos_time.to_le_bytes());
+        header.extend_from_slice(&meta.dos_date.to_le_bytes());
 
-        self.output.write_all(&0u32.to_le_bytes())?; // crc32 placeholder
-        self.output.write_all(&0u32.to_le_bytes())?; // compressed size placeholder
-        self.output.write_all(&0u32.to_le_bytes())?; // uncompressed size placeholder
-        self.output.write_all(&(name.len() as u16).to_le_bytes())?;
+        header.extend_from_slice(&0u32.to_le_bytes()); // crc32 placeholder
+        header.extend_from_slice(&0u32.to_le_bytes()); // compressed size placeholder
+        header.extend_from_slice(&0u32.to_le_bytes()); // uncompressed size placeholder
+        header.extend_from_slice(&(name.len() as u16).to_le_bytes());
 
         // Extra field: AES (11 bytes) + Unix permissions (15 bytes) if set
         let unix_extra = &meta.unix_extra;
@@ -600,8 +602,8 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         #[cfg(not(feature = "encryption"))]
         let extra_len = unix_extra.len();
 
-        self.output.write_all(&(extra_len as u16).to_le_bytes())?; // extra len
-        self.output.write_all(name.as_bytes())?;
+        header.extend_from_slice(&(extra_len as u16).to_le_bytes()); // extra len
+        header.extend_from_slice(name.as_bytes());
 
         // Write AES extra field if encryption is enabled
         #[cfg(feature = "encryption")]
@@ -609,24 +611,25 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             // AES extra field header (0x9901)
             // Format per WinZip AE-2 spec:
             //   ID(2) + Length(2) + Version(2) + Vendor(2) + Strength(1) + ActualCompression(2) = 7 bytes data
-            self.output.write_all(&[0x01, 0x99])?; // WinZip AES encryption marker
-            self.output.write_all(&[7, 0])?; // data size (7 bytes)
-            self.output.write_all(&[2, 0])?; // AE-2 format version
-            self.output.write_all(&[0x41, 0x45])?; // vendor ID "AE"
-            self.output
-                .write_all(&[enc.strength().to_winzip_code() as u8])?; // strength (1 byte!)
-            self.output.write_all(&compression_method.to_le_bytes())?; // actual compression (2 bytes)
+            header.extend_from_slice(&[0x01, 0x99]); // WinZip AES encryption marker
+            header.extend_from_slice(&[7, 0]); // data size (7 bytes)
+            header.extend_from_slice(&[2, 0]); // AE-2 format version
+            header.extend_from_slice(&[0x41, 0x45]); // vendor ID "AE"
+            header.extend_from_slice(&[enc.strength().to_winzip_code() as u8]); // strength (1 byte!)
+            header.extend_from_slice(&compression_method.to_le_bytes()); // actual compression (2 bytes)
         }
 
         // Unix extra field (counted in extra_len above)
-        self.output.write_all(unix_extra)?;
+        header.extend_from_slice(unix_extra);
 
         // Salt and password verification follow the extra field
         #[cfg(feature = "encryption")]
         if let Some(ref enc) = encryptor {
-            self.output.write_all(enc.salt())?;
-            self.output.write_all(enc.password_verify())?;
+            header.extend_from_slice(enc.salt());
+            header.extend_from_slice(enc.password_verify());
         }
+
+        self.output.write_all(&header)?;
 
         // Create encoder for this entry based on compression method
         // Use adaptive buffer if size hint is provided
@@ -704,24 +707,16 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         // Check if buffer should be flushed to output
         let buffer = entry.encoder.get_buffer_mut();
         if buffer.should_flush() {
-            // Flush buffer to output to keep memory usage low
-            let compressed_data = buffer.take();
-
-            // Encrypt compressed data if encryption is enabled and password is set
+            // Flush buffer to output to keep memory usage low. Write and clear in
+            // place: taking the Vec would drop its capacity and regrow it from zero on
+            // every flush, which made RSS grow with the amount of data written.
             #[cfg(feature = "encryption")]
-            let data_to_write = if let Some(ref mut encryptor) = entry.encryptor {
-                let mut data_to_encrypt = compressed_data;
-                encryptor.encrypt(&mut data_to_encrypt)?;
-                data_to_encrypt
-            } else {
-                compressed_data
-            };
-
-            #[cfg(not(feature = "encryption"))]
-            let data_to_write = compressed_data;
-
-            self.output.write_all(&data_to_write)?;
-            entry.counter.add_compressed(data_to_write.len() as u64);
+            if let Some(ref mut encryptor) = entry.encryptor {
+                encryptor.encrypt(&mut buffer.buffer)?;
+            }
+            self.output.write_all(&buffer.buffer)?;
+            entry.counter.add_compressed(buffer.buffer.len() as u64);
+            buffer.buffer.clear();
         }
 
         Ok(())
@@ -772,20 +767,20 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             let compressed_size = entry.counter.compressed_count + auth_code_size;
             let uncompressed_size = entry.counter.uncompressed_count;
 
+            let mut descriptor = Vec::with_capacity(24);
             // Write data descriptor
             // signature
-            self.output.write_all(&[0x50, 0x4b, 0x07, 0x08])?;
-            self.output.write_all(&crc.to_le_bytes())?;
+            descriptor.extend_from_slice(&[0x50, 0x4b, 0x07, 0x08]);
+            descriptor.extend_from_slice(&crc.to_le_bytes());
             // If sizes exceed 32-bit, write 64-bit sizes (ZIP64 data descriptor)
             if compressed_size > u32::MAX as u64 || uncompressed_size > u32::MAX as u64 {
-                self.output.write_all(&compressed_size.to_le_bytes())?;
-                self.output.write_all(&uncompressed_size.to_le_bytes())?;
+                descriptor.extend_from_slice(&compressed_size.to_le_bytes());
+                descriptor.extend_from_slice(&uncompressed_size.to_le_bytes());
             } else {
-                self.output
-                    .write_all(&(compressed_size as u32).to_le_bytes())?;
-                self.output
-                    .write_all(&(uncompressed_size as u32).to_le_bytes())?;
+                descriptor.extend_from_slice(&(compressed_size as u32).to_le_bytes());
+                descriptor.extend_from_slice(&(uncompressed_size as u32).to_le_bytes());
             }
+            self.output.write_all(&descriptor)?;
 
             // Save entry info for central directory
             self.entries.push(ZipEntry {
@@ -797,7 +792,7 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
                 compression_method: entry.compression_method,
                 #[cfg(feature = "encryption")]
                 encryption_strength: encryption_strength_code,
-                meta: entry.meta,
+                meta: entry.meta.boxed_if_custom(),
             });
         }
         Ok(())
@@ -812,11 +807,12 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
 
         // Write central directory
         for entry in &self.entries {
-            self.output.write_all(&[0x50, 0x4b, 0x01, 0x02])?; // central dir sig
-            self.output
-                .write_all(&entry.meta.version_made_by.to_le_bytes())?; // version made by
-            self.output
-                .write_all(&cd_version_needed(entry).to_le_bytes())?; // version needed
+            // Assemble each central directory record in memory and write it once
+            let mut record = Vec::with_capacity(128 + entry.name.len());
+            let meta = entry.meta.as_deref().unwrap_or(&crate::PLAIN_META);
+            record.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]); // central dir sig
+            record.extend_from_slice(&meta.version_made_by.to_le_bytes()); // version made by
+            record.extend_from_slice(&cd_version_needed(entry).to_le_bytes()); // version needed
 
             // Set encryption flag (bit 0) if entry was encrypted
             #[cfg(feature = "encryption")]
@@ -828,34 +824,29 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             #[cfg(not(feature = "encryption"))]
             let flags = 0x08;
 
-            self.output
-                .write_all(&[flags, crate::format::FLAG_UTF8_HI])?; // general purpose bit flag
-            self.output
-                .write_all(&entry.compression_method.to_le_bytes())?; // compression method
-            self.output.write_all(&entry.meta.dos_time.to_le_bytes())?;
-            self.output.write_all(&entry.meta.dos_date.to_le_bytes())?;
-            self.output.write_all(&entry.crc32.to_le_bytes())?;
+            record.extend_from_slice(&[flags, crate::format::FLAG_UTF8_HI]); // general purpose bit flag
+            record.extend_from_slice(&entry.compression_method.to_le_bytes()); // compression method
+            record.extend_from_slice(&meta.dos_time.to_le_bytes());
+            record.extend_from_slice(&meta.dos_date.to_le_bytes());
+            record.extend_from_slice(&entry.crc32.to_le_bytes());
 
             // Write sizes (32-bit placeholders or actual values)
             if entry.compressed_size > u32::MAX as u64 {
-                self.output.write_all(&0xFFFFFFFFu32.to_le_bytes())?;
+                record.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
             } else {
-                self.output
-                    .write_all(&(entry.compressed_size as u32).to_le_bytes())?;
+                record.extend_from_slice(&(entry.compressed_size as u32).to_le_bytes());
             }
 
             if entry.uncompressed_size > u32::MAX as u64 {
-                self.output.write_all(&0xFFFFFFFFu32.to_le_bytes())?;
+                record.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
             } else {
-                self.output
-                    .write_all(&(entry.uncompressed_size as u32).to_le_bytes())?;
+                record.extend_from_slice(&(entry.uncompressed_size as u32).to_le_bytes());
             }
 
-            self.output
-                .write_all(&(entry.name.len() as u16).to_le_bytes())?;
+            record.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
 
             // Prepare extra fields
-            let mut extra_field: Vec<u8> = entry.meta.unix_extra.clone();
+            let mut extra_field: Vec<u8> = meta.unix_extra.clone();
 
             // Add AES extra field if entry was encrypted
             #[cfg(feature = "encryption")]
@@ -892,28 +883,25 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
                 extra_field.extend_from_slice(&data);
             }
 
-            self.output
-                .write_all(&(extra_field.len() as u16).to_le_bytes())?; // extra len
-            self.output
-                .write_all(&(entry.meta.comment.len() as u16).to_le_bytes())?; // file comment len
-            self.output.write_all(&0u16.to_le_bytes())?; // disk number start
-            self.output.write_all(&0u16.to_le_bytes())?; // internal attrs
-            self.output
-                .write_all(&entry.meta.external_attrs.to_le_bytes())?; // external attrs
+            record.extend_from_slice(&(extra_field.len() as u16).to_le_bytes()); // extra len
+            record.extend_from_slice(&(meta.comment.len() as u16).to_le_bytes()); // file comment len
+            record.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+            record.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            record.extend_from_slice(&meta.external_attrs.to_le_bytes()); // external attrs
 
             // local header offset (32-bit or 0xFFFFFFFF)
             if entry.local_header_offset > u32::MAX as u64 {
-                self.output.write_all(&0xFFFFFFFFu32.to_le_bytes())?;
+                record.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
             } else {
-                self.output
-                    .write_all(&(entry.local_header_offset as u32).to_le_bytes())?;
+                record.extend_from_slice(&(entry.local_header_offset as u32).to_le_bytes());
             }
 
-            self.output.write_all(entry.name.as_bytes())?;
+            record.extend_from_slice(entry.name.as_bytes());
             if !extra_field.is_empty() {
-                self.output.write_all(&extra_field)?;
+                record.extend_from_slice(&extra_field);
             }
-            self.output.write_all(&entry.meta.comment)?;
+            record.extend_from_slice(&meta.comment);
+            self.output.write_all(&record)?;
         }
 
         let central_dir_size = self.output.stream_position()? - central_dir_offset;
