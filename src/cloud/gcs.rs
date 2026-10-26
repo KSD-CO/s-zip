@@ -38,12 +38,13 @@
 
 use crate::error::{Result, SZipError};
 use google_cloud_storage::client::Storage;
+use google_cloud_storage::model_ext::ReadRange;
 use google_cloud_storage::streaming_source::StreamingSource;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
-use tokio::io::{AsyncSeek, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
@@ -376,6 +377,151 @@ impl Drop for GCSZipWriter {
         // If the writer is dropped without calling finish(), we should try to clean up
         // However, we can't easily do this from Drop since it's not async
         // Users should ensure finish() is called properly
+    }
+}
+
+// ============================================================================
+// GCS ZIP Reader
+// ============================================================================
+
+/// GCS ZIP reader that reads ZIP files directly from Google Cloud Storage.
+///
+/// Implements `AsyncRead + AsyncSeek + Unpin + Send` using ranged reads, so it
+/// can be wrapped in `GenericAsyncZipReader` to list or extract entries without
+/// downloading the whole archive. Reads are pinned to the object generation
+/// seen at open time, so overwriting the object mid-read fails instead of
+/// mixing two versions.
+///
+/// ## Example
+///
+/// ```no_run
+/// use s_zip::{GenericAsyncZipReader, cloud::GCSZipReader};
+/// use google_cloud_storage::client::Storage;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let client = Storage::builder().build().await?;
+/// let reader = GCSZipReader::new(client, "my-bucket", "archive.zip").await?;
+/// let mut zip = GenericAsyncZipReader::new_with_buffer_size(reader, None).await?;
+///
+/// for entry in zip.entries() {
+///     println!("{}: {} bytes", entry.name, entry.uncompressed_size);
+/// }
+/// let data = zip.read_entry_by_name("file.txt").await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct GCSZipReader {
+    client: Storage,
+    bucket: String,
+    object: String,
+    generation: i64,
+    position: u64,
+    size: u64,
+    #[allow(clippy::type_complexity)]
+    read_future: Option<Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>>,
+}
+
+impl GCSZipReader {
+    /// Open `object` in `bucket` for reading.
+    pub async fn new(
+        client: Storage,
+        bucket: impl Into<String>,
+        object: impl Into<String>,
+    ) -> Result<Self> {
+        let bucket = format!("projects/_/buckets/{}", bucket.into());
+        let object = object.into();
+
+        // Read one byte to learn the object size and pin its generation
+        let response = client
+            .read_object(bucket.clone(), object.clone())
+            .set_read_range(ReadRange::head(1))
+            .send()
+            .await
+            .map_err(|e| {
+                SZipError::Io(io::Error::other(format!(
+                    "Failed to open GCS object: {}",
+                    e
+                )))
+            })?;
+        let highlights = response.object();
+
+        Ok(Self {
+            client,
+            bucket,
+            object,
+            generation: highlights.generation,
+            position: 0,
+            size: highlights.size.max(0) as u64,
+            read_future: None,
+        })
+    }
+
+    /// Total object size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl AsyncRead for GCSZipReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.read_future.is_none() {
+            if self.position >= self.size || buf.remaining() == 0 {
+                return Poll::Ready(Ok(())); // EOF
+            }
+            let start = self.position;
+            let count = (buf.remaining() as u64).min(self.size - start);
+            let request = self
+                .client
+                .read_object(self.bucket.clone(), self.object.clone())
+                .set_generation(self.generation)
+                .set_read_range(ReadRange::segment(start, count));
+
+            self.read_future = Some(Box::pin(async move {
+                let mut response = request
+                    .send()
+                    .await
+                    .map_err(|e| io::Error::other(format!("GCS read failed: {}", e)))?;
+                let mut data = Vec::with_capacity(count as usize);
+                while let Some(chunk) = response.next().await {
+                    let chunk =
+                        chunk.map_err(|e| io::Error::other(format!("GCS read failed: {}", e)))?;
+                    data.extend_from_slice(&chunk);
+                }
+                Ok(data)
+            }));
+        }
+
+        let fut = self.read_future.as_mut().expect("read future set above");
+        let result = ready!(fut.as_mut().poll(cx));
+        self.read_future = None;
+        let bytes = result?;
+        let n = bytes.len().min(buf.remaining());
+        buf.put_slice(&bytes[..n]);
+        self.position += n as u64;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncSeek for GCSZipReader {
+    fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        let new_pos = match position {
+            io::SeekFrom::Start(pos) => Some(pos),
+            io::SeekFrom::End(offset) => self.size.checked_add_signed(offset),
+            io::SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+        };
+        self.position = new_pos
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid seek position"))?;
+        // A seek invalidates any in-flight read for the old position
+        self.read_future = None;
+        Ok(())
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(self.position))
     }
 }
 

@@ -6,8 +6,8 @@
 //!
 //! ## Available Adapters
 //!
-//! - **S3** - AWS S3 multipart upload (requires `cloud-s3` feature)
-//! - **GCS** - Google Cloud Storage resumable upload (requires `cloud-gcs` feature)
+//! - **S3** - AWS S3 multipart upload and ranged reads (requires `cloud-s3` feature)
+//! - **GCS** - Google Cloud Storage resumable upload and ranged reads (requires `cloud-gcs` feature)
 //!
 //! ## S3-Compatible Services
 //!
@@ -69,4 +69,4 @@ pub mod gcs;
 pub use s3::{S3ZipReader, S3ZipReaderBuilder, S3ZipWriter, S3ZipWriterBuilder};
 
 #[cfg(feature = "cloud-gcs")]
-pub use gcs::GCSZipWriter;
+pub use gcs::{GCSZipReader, GCSZipWriter, GCSZipWriterBuilder};
