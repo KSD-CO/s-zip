@@ -8,7 +8,8 @@
 //!
 //! - Uses GCS resumable upload (chunk size must be multiple of 256KB)
 //! - Buffers writes until reaching chunk size threshold (default 8MB)
-//! - Uploads chunks in the background using Tokio tasks
+//! - Streams chunks to GCS from a background Tokio task as they are produced
+//! - The object is only committed after `finish()`; dropping the writer early aborts the upload
 //! - Tracks virtual position for ZIP central directory (no actual seeking)
 //! - Maintains constant memory usage (~8-12MB)
 //!
@@ -16,10 +17,10 @@
 //!
 //! ```ignore
 //! use s_zip::{AsyncStreamingZipWriter, cloud::GCSZipWriter};
-//! use google_cloud_storage::client::Client;
+//! use google_cloud_storage::client::Storage;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let gcs_client = Client::default().await?;
+//! let gcs_client = Storage::builder().build().await?;
 //!
 //! let writer = GCSZipWriter::new(
 //!     gcs_client,
@@ -36,8 +37,8 @@
 //! ```
 
 use crate::error::{Result, SZipError};
-use google_cloud_storage::client::Client;
-use google_cloud_storage::http::objects::upload::{UploadObjectRequest, UploadType};
+use google_cloud_storage::client::Storage;
+use google_cloud_storage::streaming_source::StreamingSource;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -82,7 +83,7 @@ enum UploadCommand {
 
 /// Builder for `GCSZipWriter` with configuration options.
 pub struct GCSZipWriterBuilder {
-    client: Option<Client>,
+    client: Option<Storage>,
     bucket: String,
     object: String,
     chunk_size: usize,
@@ -97,9 +98,9 @@ impl GCSZipWriter {
     ///
     /// ```ignore
     /// # use s_zip::cloud::GCSZipWriter;
-    /// # use google_cloud_storage::client::{Client, ClientConfig};
+    /// # use google_cloud_storage::client::Storage;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = Client::new(ClientConfig::default().with_auth().await?);
+    /// let client = Storage::builder().build().await?;
     ///
     /// let writer = GCSZipWriter::new(
     ///     client,
@@ -110,7 +111,7 @@ impl GCSZipWriter {
     /// # }
     /// ```
     pub async fn new(
-        client: Client,
+        client: Storage,
         bucket: impl Into<String>,
         object: impl Into<String>,
     ) -> Result<Self> {
@@ -128,9 +129,9 @@ impl GCSZipWriter {
     ///
     /// ```ignore
     /// # use s_zip::cloud::GCSZipWriter;
-    /// # use google_cloud_storage::client::{Client, ClientConfig};
+    /// # use google_cloud_storage::client::Storage;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = Client::new(ClientConfig::default().with_auth().await?);
+    /// let client = Storage::builder().build().await?;
     ///
     /// let writer = GCSZipWriter::builder()
     ///     .client(client)
@@ -156,7 +157,7 @@ impl GCSZipWriter {
 
 impl GCSZipWriterBuilder {
     /// Set the GCS client.
-    pub fn client(mut self, client: Client) -> Self {
+    pub fn client(mut self, client: Storage) -> Self {
         self.client = Some(client);
         self
     }
@@ -310,54 +311,58 @@ impl AsyncSeek for GCSZipWriter {
 
 impl Unpin for GCSZipWriter {}
 
-/// Background worker that handles GCS resumable upload operations.
+/// Background worker that streams buffered chunks to GCS via resumable upload.
 async fn upload_worker(
-    client: Client,
+    client: Storage,
     bucket: String,
     object: String,
-    mut rx: mpsc::UnboundedReceiver<UploadCommand>,
+    rx: mpsc::UnboundedReceiver<UploadCommand>,
 ) -> Result<()> {
-    let mut accumulated_data = Vec::new();
+    client
+        .write_object(
+            format!("projects/_/buckets/{}", bucket),
+            object,
+            ChunkSource {
+                rx,
+                finished: false,
+            },
+        )
+        .send_buffered()
+        .await
+        .map_err(|e| SZipError::Io(io::Error::other(format!("Failed to upload to GCS: {}", e))))?;
 
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            UploadCommand::UploadChunk { data } => {
-                // Accumulate data for upload
-                accumulated_data.extend_from_slice(&data);
+    Ok(())
+}
+
+/// Adapts the upload command channel into a GCS streaming payload.
+struct ChunkSource {
+    rx: mpsc::UnboundedReceiver<UploadCommand>,
+    finished: bool,
+}
+
+impl StreamingSource for ChunkSource {
+    type Error = io::Error;
+
+    async fn next(&mut self) -> Option<std::result::Result<bytes::Bytes, Self::Error>> {
+        if self.finished {
+            return None;
+        }
+        match self.rx.recv().await {
+            Some(UploadCommand::UploadChunk { data }) => Some(Ok(data.into())),
+            Some(UploadCommand::Finalize { final_data }) => {
+                self.finished = true;
+                final_data.map(|data| Ok(data.into()))
             }
-            UploadCommand::Finalize { final_data } => {
-                // Add final chunk if any
-                if let Some(data) = final_data {
-                    accumulated_data.extend_from_slice(&data);
-                }
-
-                // Upload all data at once
-                // Note: This is a simplified implementation. A production version
-                // should use proper resumable upload with chunking.
-                let upload_type = UploadType::Simple(
-                    google_cloud_storage::http::objects::upload::Media::new(object.clone()),
-                );
-
-                client
-                    .upload_object(
-                        &UploadObjectRequest {
-                            bucket: bucket.clone(),
-                            ..Default::default()
-                        },
-                        accumulated_data,
-                        &upload_type,
-                    )
-                    .await
-                    .map_err(|e| {
-                        SZipError::Io(io::Error::other(format!("Failed to upload to GCS: {}", e)))
-                    })?;
-
-                break;
+            // Writer dropped before finish(): fail so a truncated object is never committed
+            None => {
+                self.finished = true;
+                Some(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "GCS writer dropped before finish()",
+                )))
             }
         }
     }
-
-    Ok(())
 }
 
 impl Drop for GCSZipWriter {

@@ -1,7 +1,8 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 #[cfg(feature = "zstd-support")]
 use s_zip::CompressionMethod;
 use s_zip::StreamingZipWriter;
+use std::hint::black_box;
 use tempfile::NamedTempFile;
 
 fn generate_compressible_data(size: usize) -> Vec<u8> {

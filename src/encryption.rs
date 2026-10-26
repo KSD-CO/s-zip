@@ -19,7 +19,7 @@ use ctr::{
     cipher::{KeyIvInit, StreamCipher},
     Ctr128BE,
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use pbkdf2::pbkdf2_hmac;
 use sha1::Sha1;
 
@@ -159,7 +159,7 @@ impl AesEncryptor {
     /// The CTR block counter advances by `data.len()` bytes on each call so
     /// that successive calls on the same entry never reuse keystream blocks.
     pub fn encrypt(&mut self, data: &mut [u8]) -> Result<()> {
-        apply_ctr_keystream(self.strength, &self.encryption_key, self.byte_offset, data);
+        apply_ctr_keystream(self.strength, &self.encryption_key, self.byte_offset, data)?;
         self.byte_offset += data.len() as u64;
         Ok(())
     }
@@ -245,7 +245,7 @@ impl AesDecryptor {
     /// so that successive calls on the same entry remain byte-aligned.
     pub fn decrypt(&mut self, data: &mut [u8]) -> Result<()> {
         // AES-CTR decryption is identical to encryption (XOR with keystream)
-        apply_ctr_keystream(self.strength, &self.encryption_key, self.byte_offset, data);
+        apply_ctr_keystream(self.strength, &self.encryption_key, self.byte_offset, data)?;
         self.byte_offset += data.len() as u64;
         Ok(())
     }
@@ -279,11 +279,16 @@ impl AesDecryptor {
 /// This function is shared between `AesEncryptor::encrypt()` and
 /// `AesDecryptor::decrypt()` — AES-CTR encryption and decryption are
 /// identical operations.
-fn apply_ctr_keystream(strength: AesStrength, key: &[u8], byte_offset: u64, data: &mut [u8]) {
-    // CTR block counter: stored in the upper 64 bits of the 128-bit IV.
+fn apply_ctr_keystream(
+    strength: AesStrength,
+    key: &[u8],
+    byte_offset: u64,
+    data: &mut [u8],
+) -> Result<()> {
+    // CTR block counter: the 128-bit big-endian IV is the block number itself
+    // (low 64 bits). Uniqueness comes from the per-entry key derived from a random salt.
     let block_number = byte_offset / 16;
-    let mut iv = [0u8; 16];
-    iv[8..16].copy_from_slice(&block_number.to_be_bytes());
+    let iv = u128::from(block_number).to_be_bytes();
 
     // Partial-block alignment: fast-forward past bytes already consumed
     // within the current block.
@@ -291,7 +296,13 @@ fn apply_ctr_keystream(strength: AesStrength, key: &[u8], byte_offset: u64, data
 
     macro_rules! run_cipher {
         ($Aes:ty) => {{
-            let mut cipher = Ctr128BE::<$Aes>::new(key.into(), &iv.into());
+            let mut cipher = Ctr128BE::<$Aes>::new_from_slices(key, &iv).map_err(|_| {
+                SZipError::EncryptionError(format!(
+                    "Invalid AES key length: expected {}, got {}",
+                    strength.key_size(),
+                    key.len()
+                ))
+            })?;
             if partial != 0 {
                 let mut discard = vec![0u8; partial];
                 cipher.apply_keystream(&mut discard);
@@ -305,6 +316,7 @@ fn apply_ctr_keystream(strength: AesStrength, key: &[u8], byte_offset: u64, data
         AesStrength::Aes192 => run_cipher!(Aes192),
         AesStrength::Aes256 => run_cipher!(Aes256),
     }
+    Ok(())
 }
 
 /// Generate cryptographically secure random salt.
@@ -315,7 +327,7 @@ fn generate_salt(size: usize) -> Result<Vec<u8>> {
     #[cfg(feature = "encryption")]
     {
         let mut salt = vec![0u8; size];
-        getrandom::getrandom(&mut salt).map_err(|e| {
+        getrandom::fill(&mut salt).map_err(|e| {
             SZipError::EncryptionError(format!("Failed to generate random salt: {}", e))
         })?;
         Ok(salt)

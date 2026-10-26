@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-10-26
+
+### Changed ⚠️ (breaking)
+
+- **GCS: migrated to the official `google-cloud-storage` 1.x SDK** (`src/cloud/gcs.rs`).
+  `GCSZipWriter::new()` / `builder().client()` now take `google_cloud_storage::client::Storage`
+  (create with `Storage::builder().build().await?`) instead of the old `Client`.
+  The `google-cloud-auth` dependency was removed (auth is handled by `Storage`).
+- GCS uploads now stream chunks via resumable upload as they are produced, instead of
+  buffering the whole archive in memory. Dropping the writer before `finish()` aborts the
+  upload rather than committing a truncated object.
+- `aws-sdk-s3` is built with `default-features = false`, dropping the legacy hyper 0.14 /
+  rustls 0.21 TLS backend and SigV4a (S3 Multi-Region Access Points are no longer supported).
+
+### Security 🔒
+
+- Removes RUSTSEC-2026-0258, -0098, -0099, -0104, -0346, -0349, -0382 and -0387 from the
+  dependency tree; `cargo audit` is clean and the CI/`deny.toml` ignore lists were dropped.
+- CI workflow now runs with a least-privilege `GITHUB_TOKEN` (`contents: read`).
+
+### Dependencies
+
+- `aes` 0.9, `ctr` 0.10, `hmac` 0.13, `sha1` 0.11, `pbkdf2` 0.13, `getrandom` 0.4,
+  `zstd` 0.14, `criterion` 0.8 (dev), `google-cloud-storage` 1.21.
+
 ## [0.13.0] - 2026-09-04
 
 ### Added ✨
