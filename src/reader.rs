@@ -9,6 +9,7 @@ use crate::format::{
     CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_SIGNATURE, LOCAL_FILE_HEADER_SIGNATURE,
     MAX_ENTRY_ALLOC, ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE,
 };
+use crate::limits::{ExtractLimits, LimitedRead, OutputBudget};
 
 #[cfg(feature = "encryption")]
 use crate::format::parse_aes_extra_field_buf;
@@ -29,6 +30,7 @@ pub struct StreamingZipReader {
     entries: Vec<ZipEntry>,
     #[cfg(feature = "encryption")]
     password: Option<String>,
+    limits: ExtractLimits,
 }
 
 impl StreamingZipReader {
@@ -74,7 +76,21 @@ impl StreamingZipReader {
             entries,
             #[cfg(feature = "encryption")]
             password: None,
+            limits: ExtractLimits::default(),
         })
+    }
+
+    /// Set decompression limits (ZIP bomb protection).
+    ///
+    /// Use [`ExtractLimits::strict`] for archives from untrusted sources.
+    pub fn set_limits(&mut self, limits: ExtractLimits) -> &mut Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Get the current decompression limits.
+    pub fn limits(&self) -> &ExtractLimits {
+        &self.limits
     }
 
     /// Set password for decrypting encrypted entries
@@ -127,6 +143,8 @@ impl StreamingZipReader {
     /// ```
     pub fn extract_all<P: AsRef<Path>>(&mut self, dest_dir: P) -> Result<()> {
         let dest_dir = dest_dir.as_ref();
+        self.limits.check_entry_count(self.entries.len())?;
+        let mut remaining_total = self.limits.max_total_size;
         let entries = self.entries.clone();
         for entry in &entries {
             let rel_path = entry.safe_path();
@@ -147,7 +165,11 @@ impl StreamingZipReader {
                 std::fs::create_dir_all(parent)?;
             }
 
-            let data = self.read_entry(entry)?;
+            let budget = self.limits.budget(entry, true, remaining_total)?;
+            let data = self.read_entry_with_budget(entry, budget)?;
+            if let Some(rem) = remaining_total.as_mut() {
+                *rem -= data.len() as u64;
+            }
             std::fs::write(&out_path, data)?;
         }
         Ok(())
@@ -155,6 +177,15 @@ impl StreamingZipReader {
 
     /// Read an entry's decompressed data into a vector
     pub fn read_entry(&mut self, entry: &ZipEntry) -> Result<Vec<u8>> {
+        let budget = self.limits.budget(entry, true, None)?;
+        self.read_entry_with_budget(entry, budget)
+    }
+
+    fn read_entry_with_budget(
+        &mut self,
+        entry: &ZipEntry,
+        budget: OutputBudget,
+    ) -> Result<Vec<u8>> {
         // Seek to local file header
         self.file.seek(SeekFrom::Start(entry.offset))?;
 
@@ -269,18 +300,23 @@ impl StreamingZipReader {
         // Decompress if needed (Step 2: Decompress decrypted data)
         let data = if entry.compression_method == 8 {
             // DEFLATE compression
-            let mut decoder = DeflateDecoder::new(&compressed_data[..]);
+            let mut decoder = LimitedRead::new(DeflateDecoder::new(&compressed_data[..]), budget);
             let mut decompressed = Vec::new();
             decoder.read_to_end(&mut decompressed)?;
             decompressed
         } else if entry.compression_method == 0 {
             // No compression (stored)
+            budget.check(compressed_data.len() as u64)?;
             compressed_data
         } else if entry.compression_method == 93 {
             // Zstd compression
             #[cfg(feature = "zstd-support")]
             {
-                zstd::decode_all(&compressed_data[..])?
+                let mut decoder =
+                    LimitedRead::new(zstd::Decoder::new(&compressed_data[..])?, budget);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed)?;
+                decompressed
             }
             #[cfg(not(feature = "zstd-support"))]
             {
@@ -373,6 +409,16 @@ impl StreamingZipReader {
     /// Returns `SZipError::EncryptionError` if the entry is encrypted but
     /// `set_password()` was not called or the password is wrong.
     pub fn read_entry_streaming(&mut self, entry: &ZipEntry) -> Result<Box<dyn Read + '_>> {
+        let budget = self.limits.budget(entry, false, None)?;
+        let reader = self.read_entry_streaming_raw(entry)?;
+        Ok(if budget.is_unlimited() {
+            reader
+        } else {
+            Box::new(LimitedRead::new(reader, budget))
+        })
+    }
+
+    fn read_entry_streaming_raw(&mut self, entry: &ZipEntry) -> Result<Box<dyn Read + '_>> {
         // Seek to local file header
         self.file.seek(SeekFrom::Start(entry.offset))?;
 

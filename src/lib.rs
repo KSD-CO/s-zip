@@ -72,6 +72,7 @@
 
 pub mod error;
 pub mod format;
+pub mod limits;
 pub mod reader;
 pub mod writer;
 
@@ -110,6 +111,7 @@ pub mod cloud;
 
 pub use error::{Result, SZipError};
 pub use format::ZipEntry;
+pub use limits::ExtractLimits;
 pub use reader::StreamingZipReader;
 pub use writer::{CompressionMethod, StreamingZipWriter};
 

@@ -9,6 +9,7 @@ use crate::format::{
     parse_zip64_extra_field, CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_SIGNATURE,
     LOCAL_FILE_HEADER_SIGNATURE, MAX_ENTRY_ALLOC, ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE,
 };
+use crate::limits::{ExtractLimits, LimitedRead, OutputBudget};
 use async_compression::tokio::bufread::DeflateDecoder;
 #[cfg(feature = "async-zstd")]
 use async_compression::tokio::bufread::ZstdDecoder;
@@ -28,6 +29,7 @@ pub struct GenericAsyncZipReader<R: AsyncRead + AsyncSeek + Unpin + Send> {
     entries: Vec<ZipEntry>,
     #[cfg(feature = "encryption")]
     password: Option<String>,
+    limits: ExtractLimits,
 }
 
 /// Type alias for file-based async ZIP reader (convenience)
@@ -177,6 +179,8 @@ impl AsyncStreamingZipReader {
     /// ```
     pub async fn extract_all<P: AsRef<Path>>(&mut self, dest_dir: P) -> Result<()> {
         let dest_dir = dest_dir.as_ref();
+        self.limits.check_entry_count(self.entries.len())?;
+        let mut remaining_total = self.limits.max_total_size;
         let entries = self.entries.clone();
         for entry in &entries {
             let rel_path = entry.safe_path();
@@ -194,7 +198,11 @@ impl AsyncStreamingZipReader {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let data = self.read_entry(entry).await?;
+            let budget = self.limits.budget(entry, true, remaining_total)?;
+            let data = self.read_entry_with_budget(entry, budget).await?;
+            if let Some(rem) = remaining_total.as_mut() {
+                *rem -= data.len() as u64;
+            }
             tokio::fs::write(&out_path, data).await?;
         }
         Ok(())
@@ -218,7 +226,21 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
             entries,
             #[cfg(feature = "encryption")]
             password: None,
+            limits: ExtractLimits::default(),
         })
+    }
+
+    /// Set decompression limits (ZIP bomb protection).
+    ///
+    /// Use [`ExtractLimits::strict`] for archives from untrusted sources.
+    pub fn set_limits(&mut self, limits: ExtractLimits) -> &mut Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Get the current decompression limits.
+    pub fn limits(&self) -> &ExtractLimits {
+        &self.limits
     }
 
     /// Get list of all entries in the ZIP
@@ -252,6 +274,15 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
 
     /// Read an entry's decompressed data into a vector
     pub async fn read_entry(&mut self, entry: &ZipEntry) -> Result<Vec<u8>> {
+        let budget = self.limits.budget(entry, true, None)?;
+        self.read_entry_with_budget(entry, budget).await
+    }
+
+    async fn read_entry_with_budget(
+        &mut self,
+        entry: &ZipEntry,
+        budget: OutputBudget,
+    ) -> Result<Vec<u8>> {
         // Seek to local file header
         self.reader.seek(SeekFrom::Start(entry.offset)).await?;
 
@@ -363,18 +394,19 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         // Decompress if needed (Step 2)
         let data = if entry.compression_method == 8 {
             // DEFLATE compression
-            let mut decoder = DeflateDecoder::new(&compressed_data[..]);
+            let mut decoder = LimitedRead::new(DeflateDecoder::new(&compressed_data[..]), budget);
             let mut decompressed = Vec::new();
             decoder.read_to_end(&mut decompressed).await?;
             decompressed
         } else if entry.compression_method == 0 {
             // No compression (stored)
+            budget.check(compressed_data.len() as u64)?;
             compressed_data
         } else if entry.compression_method == 93 {
             // Zstd compression
             #[cfg(feature = "async-zstd")]
             {
-                let mut decoder = ZstdDecoder::new(&compressed_data[..]);
+                let mut decoder = LimitedRead::new(ZstdDecoder::new(&compressed_data[..]), budget);
                 let mut decompressed = Vec::new();
                 decoder.read_to_end(&mut decompressed).await?;
                 decompressed
@@ -454,6 +486,19 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
     /// Returns `SZipError::EncryptionError` if the entry is encrypted but
     /// `set_password()` was not called or the password is wrong.
     pub async fn read_entry_streaming(
+        &mut self,
+        entry: &ZipEntry,
+    ) -> Result<Box<dyn AsyncRead + Unpin + Send + '_>> {
+        let budget = self.limits.budget(entry, false, None)?;
+        let reader = self.read_entry_streaming_raw(entry).await?;
+        Ok(if budget.is_unlimited() {
+            reader
+        } else {
+            Box::new(LimitedRead::new(reader, budget))
+        })
+    }
+
+    async fn read_entry_streaming_raw(
         &mut self,
         entry: &ZipEntry,
     ) -> Result<Box<dyn AsyncRead + Unpin + Send + '_>> {
