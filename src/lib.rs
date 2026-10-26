@@ -106,6 +106,9 @@ pub mod parallel;
 #[cfg(feature = "async")]
 pub mod seekless;
 
+#[cfg(feature = "async")]
+pub mod stream_reader;
+
 #[cfg(any(feature = "cloud-s3", feature = "cloud-gcs"))]
 pub mod cloud;
 
@@ -295,6 +298,9 @@ pub use async_reader::{AsyncStreamingZipReader, GenericAsyncZipReader};
 
 #[cfg(feature = "async")]
 pub use parallel::{ParallelConfig, ParallelEntry};
+
+#[cfg(feature = "async")]
+pub use stream_reader::ZipStreamReader;
 
 #[cfg(test)]
 mod tests {

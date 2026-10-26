@@ -95,17 +95,11 @@ impl ExtractLimits {
         if let Some(rem) = remaining_total {
             max = Some(max.map_or(rem, |m| m.min(rem)));
         }
-        let ratio_max = self.max_ratio.map(|r| {
-            entry
-                .compressed_size
-                .saturating_mul(r)
-                .max(RATIO_GRACE_BYTES)
-        });
-
         let budget = OutputBudget {
             name: entry.name.clone(),
             max,
-            ratio_max,
+            ratio: self.max_ratio,
+            compressed_size: entry.compressed_size,
         };
         // Reject early when the declared size already exceeds the budget
         budget.check(entry.uncompressed_size)?;
@@ -118,15 +112,22 @@ impl ExtractLimits {
 pub(crate) struct OutputBudget {
     name: String,
     max: Option<u64>,
-    ratio_max: Option<u64>,
+    ratio: Option<u64>,
+    compressed_size: u64,
 }
 
 impl OutputBudget {
     pub(crate) fn is_unlimited(&self) -> bool {
-        self.max.is_none() && self.ratio_max.is_none()
+        self.max.is_none() && self.ratio.is_none()
     }
 
     pub(crate) fn check(&self, produced: u64) -> Result<()> {
+        self.check_with_compressed(produced, self.compressed_size)
+    }
+
+    /// Check against the compressed bytes consumed so far (for entries whose
+    /// compressed size is not known up front).
+    pub(crate) fn check_with_compressed(&self, produced: u64, compressed: u64) -> Result<()> {
         if let Some(max) = self.max {
             if produced > max {
                 return Err(SZipError::LimitExceeded(format!(
@@ -135,7 +136,8 @@ impl OutputBudget {
                 )));
             }
         }
-        if let Some(ratio_max) = self.ratio_max {
+        if let Some(ratio) = self.ratio {
+            let ratio_max = compressed.saturating_mul(ratio).max(RATIO_GRACE_BYTES);
             if produced > ratio_max {
                 return Err(SZipError::LimitExceeded(format!(
                     "entry '{}' exceeds the maximum compression ratio",
@@ -147,9 +149,13 @@ impl OutputBudget {
     }
 
     fn io_check(&self, produced: u64) -> io::Result<()> {
-        self.check(produced)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        self.check(produced).map_err(into_io)
     }
+}
+
+/// Wrap an `SZipError` so it can travel through `io::Read`/`AsyncRead`.
+pub(crate) fn into_io(err: SZipError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, err)
 }
 
 /// `Read` adapter that fails once the inner reader produces more than the budget.
@@ -190,7 +196,12 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LimitedRead<R> {
         match std::pin::Pin::new(&mut this.inner).poll_read(cx, buf) {
             std::task::Poll::Ready(Ok(())) => {
                 this.produced += (buf.filled().len() - before) as u64;
-                std::task::Poll::Ready(this.budget.io_check(this.produced))
+                let result = this.budget.io_check(this.produced);
+                if result.is_err() {
+                    // AsyncRead contract: nothing may be filled when returning an error
+                    buf.set_filled(before);
+                }
+                std::task::Poll::Ready(result)
             }
             other => other,
         }

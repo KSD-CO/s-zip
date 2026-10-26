@@ -4,10 +4,12 @@
 //! implementing AsyncRead + AsyncSeek + Unpin + Send.
 
 use crate::error::{Result, SZipError};
+#[cfg(feature = "encryption")]
+use crate::format::parse_aes_extra_field_buf;
 use crate::format::{
-    find_eocd_in_buffer, find_zip64_eocd_offset, parse_aes_extra_field_buf,
-    parse_zip64_extra_field, CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_SIGNATURE,
-    LOCAL_FILE_HEADER_SIGNATURE, MAX_ENTRY_ALLOC, ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE,
+    find_eocd_in_buffer, find_zip64_eocd_offset, parse_zip64_extra_field,
+    CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_SIGNATURE, LOCAL_FILE_HEADER_SIGNATURE,
+    MAX_ENTRY_ALLOC, ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE,
 };
 use crate::limits::{ExtractLimits, LimitedRead, OutputBudget};
 use async_compression::tokio::bufread::DeflateDecoder;
