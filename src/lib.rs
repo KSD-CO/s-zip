@@ -80,6 +80,12 @@ pub mod writer;
 pub mod encryption;
 
 #[cfg(feature = "encryption")]
+pub mod zipcrypto;
+
+#[cfg(feature = "legacy-codecs")]
+pub mod legacy;
+
+#[cfg(feature = "encryption")]
 pub mod decrypt_reader;
 
 /// Emit a `tracing::trace!` event when the `tracing` feature is enabled.

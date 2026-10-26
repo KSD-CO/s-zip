@@ -24,6 +24,8 @@ allow = [
     "CC0-1.0",
     # webpki-root-certs (Mozilla CA bundle), pulled in by google-cloud-storage
     "CDLA-Permissive-2.0",
+    # libbz2-rs-sys (BSD-style bzip2 license), pulled in by the legacy-codecs feature
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
 

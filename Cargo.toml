@@ -23,6 +23,10 @@ sha1 = { version = "0.11", optional = true }
 pbkdf2 = { version = "0.13", optional = true }
 getrandom = { version = "0.4", optional = true }
 
+# Legacy codecs, read-only (optional)
+bzip2 = { version = "0.6", optional = true }
+liblzma = { version = "0.4", optional = true }
+
 # Async dependencies (optional)
 tokio = { version = "1.35", optional = true, features = ["io-util", "fs", "sync", "rt", "macros"] }
 async-compression = { version = "0.4", optional = true, features = ["tokio", "deflate", "zstd"] }
@@ -43,11 +47,14 @@ criterion = { version = "0.8", features = ["html_reports"] }
 tokio-test = "0.4"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
 proptest = "1.4"
+bzip2 = "0.6"
+liblzma = "0.4"
 
 [features]
 default = []
 tracing = ["dep:tracing"]
 zstd-support = ["zstd"]
+legacy-codecs = ["dep:bzip2", "dep:liblzma", "async-compression?/bzip2", "async-compression?/lzma", "async-compression?/xz"]
 encryption = ["aes", "ctr", "hmac", "sha1", "pbkdf2", "getrandom"]
 async = ["tokio", "async-compression", "futures-util", "pin-project-lite"]
 async-zstd = ["async", "zstd-support", "async-compression/zstd"]

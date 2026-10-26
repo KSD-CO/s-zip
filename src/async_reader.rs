@@ -306,8 +306,10 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         // Read compression method (skip — use value from central directory)
         self.reader.seek(SeekFrom::Current(2)).await?;
 
-        // Skip modification time and date, CRC-32
-        self.reader.seek(SeekFrom::Current(8)).await?;
+        // Read modification time (ZipCrypto check byte), skip date and CRC-32
+        #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
+        let mod_time = self.read_u16_le().await?;
+        self.reader.seek(SeekFrom::Current(6)).await?;
 
         // Skip compressed and uncompressed sizes (use from central directory)
         self.reader.seek(SeekFrom::Current(8)).await?;
@@ -377,6 +379,30 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
             None
         };
 
+        // Encrypted without an AES extra field: traditional PKWARE (ZipCrypto)
+        #[cfg(feature = "encryption")]
+        let is_zipcrypto = is_encrypted_local && encryption_info.is_none();
+        #[cfg(feature = "encryption")]
+        if is_zipcrypto {
+            let password = self.password.as_ref().ok_or_else(|| {
+                SZipError::EncryptionError(
+                    "Encrypted entry but no password set. Call set_password() first.".to_string(),
+                )
+            })?;
+            if compressed_data.len() < crate::zipcrypto::HEADER_LEN as usize {
+                return Err(SZipError::InvalidFormat(
+                    "ZipCrypto entry is shorter than its encryption header".to_string(),
+                ));
+            }
+            let header: [u8; 12] = compressed_data[..12].try_into().unwrap();
+            let check = crate::zipcrypto::check_byte(flags, entry.crc32, mod_time);
+            let mut keys = crate::zipcrypto::Keys::from_header(password, &header, check)?;
+            compressed_data.drain(..12);
+            keys.decrypt(&mut compressed_data);
+        }
+        #[cfg(not(feature = "encryption"))]
+        let is_zipcrypto = false;
+
         // Decrypt compressed data in-place (Step 1)
         #[cfg(feature = "encryption")]
         let decryptor_opt = if let Some((strength, salt, pw_verify)) = encryption_info {
@@ -418,6 +444,23 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
                 return Err(SZipError::UnsupportedCompression(entry.compression_method));
             }
         } else {
+            // Data is already in memory, so the sync legacy decoders are fine here
+            #[cfg(feature = "legacy-codecs")]
+            if crate::legacy::is_legacy_method(entry.compression_method) {
+                use std::io::Read;
+                let decoder = crate::legacy::decoder(
+                    entry.compression_method,
+                    flags,
+                    entry.uncompressed_size,
+                    &compressed_data[..],
+                )?;
+                let mut decompressed = Vec::new();
+                LimitedRead::new(decoder, budget).read_to_end(&mut decompressed)?;
+                decompressed
+            } else {
+                return Err(SZipError::UnsupportedCompression(entry.compression_method));
+            }
+            #[cfg(not(feature = "legacy-codecs"))]
             return Err(SZipError::UnsupportedCompression(entry.compression_method));
         };
 
@@ -432,7 +475,8 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
 
         // Verify CRC-32 integrity — catches bit-rot and truncated downloads.
         // Skip for encrypted entries (HMAC provides stronger authentication).
-        if entry.crc32 != 0 && !entry.is_encrypted {
+        // ZipCrypto has no MAC, so its CRC must be checked
+        if entry.crc32 != 0 && (!entry.is_encrypted || is_zipcrypto) {
             let actual_crc = crc32fast::hash(&data);
             if actual_crc != entry.crc32 {
                 return Err(SZipError::InvalidFormat(format!(
@@ -515,11 +559,15 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
             ));
         }
 
-        // Skip version, flags, compression method
-        self.reader.seek(SeekFrom::Current(6)).await?;
+        // Skip version; read flags; skip compression method
+        self.reader.seek(SeekFrom::Current(2)).await?;
+        let flags = self.read_u16_le().await?;
+        self.reader.seek(SeekFrom::Current(2)).await?;
 
-        // Skip modification time and date, CRC-32
-        self.reader.seek(SeekFrom::Current(8)).await?;
+        // Read modification time (ZipCrypto check byte), skip date and CRC-32
+        #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
+        let mod_time = self.read_u16_le().await?;
+        self.reader.seek(SeekFrom::Current(6)).await?;
 
         // Read compressed and uncompressed sizes (use from central directory)
         self.reader.seek(SeekFrom::Current(8)).await?;
@@ -578,9 +626,23 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
                     Err(SZipError::UnsupportedCompression(entry.compression_method))
                 };
             } else {
-                self.reader
-                    .seek(SeekFrom::Current(extra_len as i64))
-                    .await?;
+                // No AES extra field: traditional PKWARE (ZipCrypto) encryption.
+                // parse_aes_extra_field() already consumed the extra field.
+                let password = self.password.clone().ok_or_else(|| {
+                    SZipError::EncryptionError(
+                        "Encrypted entry but no password set. Call set_password() first."
+                            .to_string(),
+                    )
+                })?;
+                let check = crate::zipcrypto::check_byte(flags, entry.crc32, mod_time);
+                let limited_reader = (&mut self.reader).take(entry.compressed_size);
+                let reader = crate::zipcrypto::nonblocking::ZipCryptoReader::new(
+                    limited_reader,
+                    &password,
+                    check,
+                )
+                .await?;
+                return decompressing_reader(entry, flags, reader).await;
             }
         }
 
@@ -600,28 +662,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         // Create a reader limited to compressed data size
         let limited_reader = (&mut self.reader).take(entry.compressed_size);
 
-        // Wrap with decompressor if needed
-        if entry.compression_method == 8 {
-            // DEFLATE compression
-            Ok(Box::new(DeflateDecoder::new(BufReader::new(
-                limited_reader,
-            ))))
-        } else if entry.compression_method == 0 {
-            // No compression (stored)
-            Ok(Box::new(limited_reader))
-        } else if entry.compression_method == 93 {
-            // Zstd compression
-            #[cfg(feature = "async-zstd")]
-            {
-                Ok(Box::new(ZstdDecoder::new(BufReader::new(limited_reader))))
-            }
-            #[cfg(not(feature = "async-zstd"))]
-            {
-                Err(SZipError::UnsupportedCompression(entry.compression_method))
-            }
-        } else {
-            Err(SZipError::UnsupportedCompression(entry.compression_method))
-        }
+        decompressing_reader(entry, flags, limited_reader).await
     }
 
     /// Get a streaming reader for an entry by name
@@ -915,5 +956,24 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> GenericAsyncZipReader<R> {
         self.reader.read_exact(&mut pw_verify).await?;
 
         Ok(Some((strength, salt, pw_verify)))
+    }
+}
+
+/// Wrap the entry's (decrypted) compressed bytes in the matching decompressor.
+async fn decompressing_reader<'a, R: AsyncRead + Unpin + Send + 'a>(
+    entry: &ZipEntry,
+    #[cfg_attr(not(feature = "legacy-codecs"), allow(unused_variables))] flags: u16,
+    reader: R,
+) -> Result<Box<dyn AsyncRead + Unpin + Send + 'a>> {
+    match entry.compression_method {
+        0 => Ok(Box::new(reader)),
+        8 => Ok(Box::new(DeflateDecoder::new(BufReader::new(reader)))),
+        #[cfg(feature = "async-zstd")]
+        93 => Ok(Box::new(ZstdDecoder::new(BufReader::new(reader)))),
+        #[cfg(feature = "legacy-codecs")]
+        m if crate::legacy::is_legacy_method(m) => {
+            crate::legacy::nonblocking::decoder(m, flags, entry.uncompressed_size, reader).await
+        }
+        m => Err(SZipError::UnsupportedCompression(m)),
     }
 }
