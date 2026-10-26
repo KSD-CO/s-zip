@@ -21,6 +21,48 @@ pub const END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06054b50;
 /// ZIP64 end-of-central-directory record signature (`PK\x06\x06`)
 pub const ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x06064b50;
 
+// ── General purpose flags ─────────────────────────────────────────────────────
+
+/// General purpose bit 11 (language encoding): file name is UTF-8.
+pub const FLAG_UTF8: u16 = 1 << 11;
+
+/// High byte of `FLAG_UTF8`, for writers that emit the flag field as two bytes.
+pub const FLAG_UTF8_HI: u8 = (FLAG_UTF8 >> 8) as u8;
+
+/// Upper half (0x80–0xFF) of IBM code page 437, the legacy ZIP file name encoding.
+const CP437_HIGH: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ', 'Æ',
+    'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ', 'á', 'í', 'ó', 'ú', 'ñ', 'Ñ',
+    'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕',
+    '╣', '║', '╗', '╝', '╜', '╛', '┐', '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦',
+    '╠', '═', '╬', '╧', '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐',
+    '▀', 'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', '≡', '±',
+    '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{a0}',
+];
+
+/// Decode an entry file name.
+///
+/// Uses UTF-8 when general purpose bit 11 is set or the bytes are valid UTF-8;
+/// otherwise falls back to CP437, the encoding legacy (pre-UTF-8) archivers use.
+pub fn decode_file_name(bytes: &[u8], flags: u16) -> String {
+    if flags & FLAG_UTF8 != 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => bytes
+            .iter()
+            .map(|&b| {
+                if b < 0x80 {
+                    b as char
+                } else {
+                    CP437_HIGH[(b - 0x80) as usize]
+                }
+            })
+            .collect(),
+    }
+}
+
 // ── Limits ────────────────────────────────────────────────────────────────────
 
 /// Maximum single-entry allocation (2 GiB).
@@ -223,6 +265,20 @@ pub fn parse_aes_extra_field_buf(extra_buf: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_decode_file_name_utf8_flag() {
+        let name = "Báo cáo.txt";
+        assert_eq!(decode_file_name(name.as_bytes(), FLAG_UTF8), name);
+        // Valid UTF-8 without the flag is still decoded as UTF-8
+        assert_eq!(decode_file_name(name.as_bytes(), 0), name);
+    }
+
+    #[test]
+    fn test_decode_file_name_cp437_fallback() {
+        // "Ä" (0x8E) and "é" (0x82) in CP437, invalid as UTF-8
+        assert_eq!(decode_file_name(&[0x8E, b'.', 0x82], 0), "Ä.é");
+    }
 
     #[test]
     fn test_find_eocd_in_buffer_found() {

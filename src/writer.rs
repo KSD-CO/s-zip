@@ -557,7 +557,8 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
         // Write local file header with data descriptor flag (bit 3) + encryption flag (bit 0)
         self.output.write_all(&[0x50, 0x4b, 0x03, 0x04])?; // signature
         self.output.write_all(&[51, 0])?; // version needed (5.1 for AES)
-        self.output.write_all(&[8 | encryption_flag, 0])?; // general purpose bit flag
+        self.output
+            .write_all(&[8 | encryption_flag, crate::format::FLAG_UTF8_HI])?; // general purpose bit flag
         self.output.write_all(&compression_method.to_le_bytes())?; // compression method
 
         // MS-DOS timestamp (time, date)
@@ -795,7 +796,8 @@ impl<W: Write + Seek> StreamingZipWriter<W> {
             #[cfg(not(feature = "encryption"))]
             let flags = 0x08;
 
-            self.output.write_all(&[flags, 0])?; // general purpose bit flag
+            self.output
+                .write_all(&[flags, crate::format::FLAG_UTF8_HI])?; // general purpose bit flag
             self.output
                 .write_all(&entry.compression_method.to_le_bytes())?; // compression method
             self.output.write_all(&[0, 0, 0, 0])?; // mod time/date

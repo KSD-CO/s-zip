@@ -589,7 +589,7 @@ impl StreamingZipReader {
             // Read filename
             let mut filename_buf = vec![0u8; filename_len];
             file.read_exact(&mut filename_buf)?;
-            let name = String::from_utf8_lossy(&filename_buf).to_string();
+            let name = crate::format::decode_file_name(&filename_buf, flags);
 
             // Read extra field so we can parse ZIP64 extra if present
             let mut extra_buf = vec![0u8; extra_len];

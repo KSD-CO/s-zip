@@ -568,7 +568,9 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
         // Write local file header with data descriptor flag (bit 3) + encryption flag (bit 0)
         self.output.write_all(&[0x50, 0x4b, 0x03, 0x04]).await?; // signature
         self.output.write_all(&[51, 0]).await?; // version needed (5.1 for AES)
-        self.output.write_all(&[8 | encryption_flag, 0]).await?; // general purpose bit flag
+        self.output
+            .write_all(&[8 | encryption_flag, crate::format::FLAG_UTF8_HI])
+            .await?; // general purpose bit flag
         self.output
             .write_all(&compression_method.to_le_bytes())
             .await?; // compression method
@@ -869,7 +871,9 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
                                                                      // version needed: 4.5 (ZIP64) or 2.0 (standard)
             let version_needed: u16 = if needs_zip64 { 45 } else { 20 };
             self.output.write_all(&version_needed.to_le_bytes()).await?;
-            self.output.write_all(&[8, 0]).await?; // general purpose bit flag (bit 3 set)
+            self.output
+                .write_all(&[8, crate::format::FLAG_UTF8_HI])
+                .await?; // general purpose bit flag (bit 3 + UTF-8)
             self.output.write_all(&[8, 0]).await?; // compression method (DEFLATE)
             self.output.write_all(&[0, 0, 0, 0]).await?; // mod time/date
             self.output.write_all(&entry.crc32.to_le_bytes()).await?;
@@ -951,7 +955,9 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> AsyncStreamingZipWriter<W> {
             #[cfg(not(feature = "encryption"))]
             let flags = 0x08;
 
-            self.output.write_all(&[flags, 0]).await?; // general purpose bit flag
+            self.output
+                .write_all(&[flags, crate::format::FLAG_UTF8_HI])
+                .await?; // general purpose bit flag
             self.output
                 .write_all(&entry.compression_method.to_le_bytes())
                 .await?; // compression method

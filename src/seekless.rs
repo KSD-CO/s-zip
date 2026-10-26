@@ -149,7 +149,7 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
         let mut header = Vec::with_capacity(30 + name_bytes.len() + extra_field_local.len());
         header.extend_from_slice(&0x04034b50u32.to_le_bytes()); // local sig
         header.extend_from_slice(&version_needed.to_le_bytes());
-        header.extend_from_slice(&0u16.to_le_bytes()); // flags
+        header.extend_from_slice(&crate::format::FLAG_UTF8.to_le_bytes()); // flags
         header.extend_from_slice(&method_u16.to_le_bytes());
         header.extend_from_slice(&dos_time.to_le_bytes());
         header.extend_from_slice(&dos_date.to_le_bytes());
@@ -236,7 +236,7 @@ impl<W: AsyncWrite + Unpin> SeeklessZipWriter<W> {
             cd.extend_from_slice(&0x02014b50u32.to_le_bytes()); // central dir sig
             cd.extend_from_slice(&version_needed.to_le_bytes()); // version made by
             cd.extend_from_slice(&version_needed.to_le_bytes()); // version needed
-            cd.extend_from_slice(&0u16.to_le_bytes()); // flags
+            cd.extend_from_slice(&crate::format::FLAG_UTF8.to_le_bytes()); // flags
             cd.extend_from_slice(&entry.compression_method.to_le_bytes());
             cd.extend_from_slice(&entry.dos_time.to_le_bytes());
             cd.extend_from_slice(&entry.dos_date.to_le_bytes());
