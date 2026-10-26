@@ -43,6 +43,9 @@ tokio-util = { version = "0.7", optional = true }
 azure_storage_blob = { version = "1.1", optional = true }
 azure_core = { version = "1.1", optional = true }
 
+# Command-line tool (optional)
+clap = { version = "4.5", optional = true, features = ["derive", "env"] }
+
 [dev-dependencies]
 tempfile = "3.8"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -67,6 +70,11 @@ cloud-s3 = ["async", "aws-config", "aws-sdk-s3", "tokio-util"]
 cloud-gcs = ["async", "google-cloud-storage", "bytes", "tokio-util"]
 cloud-azure = ["async", "azure_storage_blob", "azure_core", "tokio-util", "bytes"]
 cloud-all = ["cloud-s3", "cloud-gcs", "cloud-azure"]
+cli = ["dep:clap", "encryption", "zstd-support", "legacy-codecs"]
+
+[[bin]]
+name = "s-zip"
+required-features = ["cli"]
 
 [[bench]]
 name = "compression_bench"

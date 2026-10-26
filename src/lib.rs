@@ -291,6 +291,7 @@ pub(crate) struct EntryMeta {
 
 impl EntryMeta {
     /// Metadata for entries written without `EntryOptions`.
+    #[cfg(feature = "async")]
     pub(crate) fn plain() -> Self {
         Self {
             version_made_by: 20,
