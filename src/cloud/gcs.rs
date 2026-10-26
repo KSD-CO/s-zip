@@ -42,9 +42,10 @@ use google_cloud_storage::streaming_source::StreamingSource;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncSeek, AsyncWrite};
 use tokio::sync::mpsc;
+use tokio_util::sync::PollSender;
 
 /// Default chunk size for GCS resumable upload (8MB)
 /// Must be multiple of 256KB
@@ -59,7 +60,7 @@ pub const CHUNK_ALIGNMENT: usize = 256 * 1024;
 /// with `AsyncStreamingZipWriter`.
 pub struct GCSZipWriter {
     /// Upload state (managed by background task)
-    upload_tx: mpsc::UnboundedSender<UploadCommand>,
+    upload_tx: PollSender<UploadCommand>,
     upload_task: Option<tokio::task::JoinHandle<Result<()>>>,
 
     /// Write buffer (accumulates data until chunk_size)
@@ -197,13 +198,14 @@ impl GCSZipWriterBuilder {
             .client
             .ok_or_else(|| SZipError::InvalidFormat("GCS client must be set".to_string()))?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Capacity 1 keeps at most ~2 chunks queued besides what the SDK is sending
+        let (tx, rx) = mpsc::channel(1);
 
         // Spawn background task for uploading chunks
         let upload_task = tokio::spawn(upload_worker(client, self.bucket, self.object, rx));
 
         Ok(GCSZipWriter {
-            upload_tx: tx,
+            upload_tx: PollSender::new(tx),
             upload_task: Some(upload_task),
             buffer: Vec::with_capacity(self.chunk_size),
             chunk_size: self.chunk_size,
@@ -216,31 +218,28 @@ impl GCSZipWriterBuilder {
 impl AsyncWrite for GCSZipWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Add data to buffer
-        self.buffer.extend_from_slice(buf);
-        self.position += buf.len() as u64;
-
-        // Check if we should flush a chunk
+        // Hand a full buffer to the upload task first; wait (backpressure) while
+        // the task is busy so memory stays bounded when the network is slower
         if self.buffer.len() >= self.chunk_size {
+            if ready!(self.upload_tx.poll_reserve(cx)).is_err() {
+                return Poll::Ready(Err(upload_task_gone()));
+            }
             let chunk_size = self.chunk_size;
             let data = std::mem::replace(&mut self.buffer, Vec::with_capacity(chunk_size));
-
-            // Send to background task (non-blocking)
             if self
                 .upload_tx
-                .send(UploadCommand::UploadChunk { data })
+                .send_item(UploadCommand::UploadChunk { data })
                 .is_err()
             {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Upload task terminated unexpectedly",
-                )));
+                return Poll::Ready(Err(upload_task_gone()));
             }
         }
 
+        self.buffer.extend_from_slice(buf);
+        self.position += buf.len() as u64;
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -252,6 +251,9 @@ impl AsyncWrite for GCSZipWriter {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Only send Complete command once
         if !self.shutdown_initiated {
+            if ready!(self.upload_tx.poll_reserve(cx)).is_err() {
+                return Poll::Ready(Err(upload_task_gone()));
+            }
             self.shutdown_initiated = true;
             // Send final chunk (if any) and finalize upload
             let final_data = if !self.buffer.is_empty() {
@@ -263,13 +265,10 @@ impl AsyncWrite for GCSZipWriter {
             // Send finalize command
             if self
                 .upload_tx
-                .send(UploadCommand::Finalize { final_data })
+                .send_item(UploadCommand::Finalize { final_data })
                 .is_err()
             {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Upload task terminated unexpectedly",
-                )));
+                return Poll::Ready(Err(upload_task_gone()));
             }
         }
         // Wait for background task to complete
@@ -311,12 +310,19 @@ impl AsyncSeek for GCSZipWriter {
 
 impl Unpin for GCSZipWriter {}
 
+fn upload_task_gone() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "Upload task terminated unexpectedly",
+    )
+}
+
 /// Background worker that streams buffered chunks to GCS via resumable upload.
 async fn upload_worker(
     client: Storage,
     bucket: String,
     object: String,
-    rx: mpsc::UnboundedReceiver<UploadCommand>,
+    rx: mpsc::Receiver<UploadCommand>,
 ) -> Result<()> {
     client
         .write_object(
@@ -336,7 +342,7 @@ async fn upload_worker(
 
 /// Adapts the upload command channel into a GCS streaming payload.
 struct ChunkSource {
-    rx: mpsc::UnboundedReceiver<UploadCommand>,
+    rx: mpsc::Receiver<UploadCommand>,
     finished: bool,
 }
 
@@ -370,5 +376,55 @@ impl Drop for GCSZipWriter {
         // If the writer is dropped without calling finish(), we should try to clean up
         // However, we can't easily do this from Drop since it's not async
         // Users should ensure finish() is called properly
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn test_writer_applies_backpressure() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut writer = GCSZipWriter {
+            upload_tx: PollSender::new(tx),
+            upload_task: None,
+            buffer: Vec::new(),
+            chunk_size: 4,
+            position: 0,
+            shutdown_initiated: false,
+        };
+
+        // Nobody drains the channel: after one queued chunk the writer must stall
+        let data = [0u8; 4];
+        let mut task = tokio_test::task::spawn(async {
+            for _ in 0..4 {
+                writer.write_all(&data).await.unwrap();
+            }
+        });
+        assert!(task.poll().is_pending());
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UploadCommand::UploadChunk { .. })
+        ));
+        assert!(task.is_woken());
+    }
+
+    #[tokio::test]
+    async fn test_chunk_source_errors_when_writer_dropped() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut source = ChunkSource {
+            rx,
+            finished: false,
+        };
+        tx.send(UploadCommand::UploadChunk { data: vec![1, 2] })
+            .await
+            .unwrap();
+        drop(tx);
+        assert_eq!(source.next().await.unwrap().unwrap().as_ref(), &[1, 2]);
+        assert!(source.next().await.unwrap().is_err());
+        assert!(source.next().await.is_none());
     }
 }

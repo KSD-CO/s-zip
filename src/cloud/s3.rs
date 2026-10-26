@@ -40,10 +40,11 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncSeek, AsyncWrite};
 use tokio::sync::mpsc;
+use tokio_util::sync::PollSender;
 
 /// Default part size for S3 multipart upload (5MB - S3 minimum)
 pub const DEFAULT_PART_SIZE: usize = 5 * 1024 * 1024;
@@ -60,7 +61,7 @@ pub const MAX_PARTS: usize = 10_000;
 /// with `AsyncStreamingZipWriter`.
 pub struct S3ZipWriter {
     /// Upload state (managed by background task)
-    upload_tx: mpsc::UnboundedSender<UploadCommand>,
+    upload_tx: PollSender<UploadCommand>,
     upload_task: Option<tokio::task::JoinHandle<Result<()>>>,
 
     /// Write buffer (accumulates data until part_size)
@@ -356,7 +357,8 @@ impl S3ZipWriterBuilder {
             }
         };
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Capacity 1 + in-flight uploads bounds memory to ~(max_concurrent + 2) parts
+        let (tx, rx) = mpsc::channel(1);
 
         // Spawn background task for uploading parts with concurrent support
         let max_concurrent = self.max_concurrent_uploads;
@@ -369,7 +371,7 @@ impl S3ZipWriterBuilder {
         ));
 
         Ok(S3ZipWriter {
-            upload_tx: tx,
+            upload_tx: PollSender::new(tx),
             upload_task: Some(upload_task),
             buffer: Vec::with_capacity(self.part_size),
             part_size: self.part_size,
@@ -384,35 +386,30 @@ impl S3ZipWriterBuilder {
 impl AsyncWrite for S3ZipWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Add data to buffer
-        self.buffer.extend_from_slice(buf);
-        self.position += buf.len() as u64;
-
-        // Check if we should flush a part
+        // Hand a full buffer to the upload task first; wait (backpressure) while
+        // the task is busy so memory stays bounded when the network is slower
         if self.buffer.len() >= self.part_size {
+            if ready!(self.upload_tx.poll_reserve(cx)).is_err() {
+                return Poll::Ready(Err(upload_task_gone()));
+            }
             let part_size = self.part_size;
             let data = std::mem::replace(&mut self.buffer, Vec::with_capacity(part_size));
             self.current_part_number += 1;
-
-            // Send to background task (non-blocking)
+            let part_number = self.current_part_number;
             if self
                 .upload_tx
-                .send(UploadCommand::UploadPart {
-                    part_number: self.current_part_number,
-                    data,
-                })
+                .send_item(UploadCommand::UploadPart { part_number, data })
                 .is_err()
             {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Upload task terminated unexpectedly",
-                )));
+                return Poll::Ready(Err(upload_task_gone()));
             }
         }
 
+        self.buffer.extend_from_slice(buf);
+        self.position += buf.len() as u64;
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -424,6 +421,9 @@ impl AsyncWrite for S3ZipWriter {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Only send Complete command once
         if !self.shutdown_initiated {
+            if ready!(self.upload_tx.poll_reserve(cx)).is_err() {
+                return Poll::Ready(Err(upload_task_gone()));
+            }
             self.shutdown_initiated = true;
 
             // Send final part (if any) and complete upload
@@ -433,16 +433,12 @@ impl AsyncWrite for S3ZipWriter {
                 None
             };
 
-            // Send completion command
             if self
                 .upload_tx
-                .send(UploadCommand::Complete { final_data })
+                .send_item(UploadCommand::Complete { final_data })
                 .is_err()
             {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Upload task terminated unexpectedly",
-                )));
+                return Poll::Ready(Err(upload_task_gone()));
             }
         }
 
@@ -485,185 +481,25 @@ impl AsyncSeek for S3ZipWriter {
 
 impl Unpin for S3ZipWriter {}
 
-/// Background worker that handles S3 multipart upload operations (sequential, deprecated).
-///
-/// This is the old sequential implementation kept for reference.
-/// Use `upload_worker_concurrent` for better performance.
-#[allow(dead_code)]
-async fn upload_worker(
-    client: Client,
-    bucket: String,
-    key: String,
-    mut rx: mpsc::UnboundedReceiver<UploadCommand>,
-) -> Result<()> {
-    let mut upload_id: Option<String> = None;
-    let mut parts: Vec<CompletedPart> = Vec::new();
-
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            UploadCommand::UploadPart { part_number, data } => {
-                // Initialize multipart upload if first part
-                if upload_id.is_none() {
-                    let response = client
-                        .create_multipart_upload()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            SZipError::Io(io::Error::other(format!(
-                                "Failed to create multipart upload: {}",
-                                e
-                            )))
-                        })?;
-
-                    upload_id = Some(
-                        response
-                            .upload_id()
-                            .ok_or_else(|| {
-                                SZipError::Io(io::Error::other("No upload_id returned from S3"))
-                            })?
-                            .to_string(),
-                    );
-                }
-
-                // Upload part
-                let response = client
-                    .upload_part()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .upload_id(upload_id.as_ref().unwrap())
-                    .part_number(part_number as i32)
-                    .body(ByteStream::from(data))
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        SZipError::Io(io::Error::other(format!(
-                            "Failed to upload part {}: {}",
-                            part_number, e
-                        )))
-                    })?;
-
-                let etag = response
-                    .e_tag()
-                    .ok_or_else(|| {
-                        SZipError::Io(io::Error::other(format!(
-                            "No ETag returned for part {}",
-                            part_number
-                        )))
-                    })?
-                    .to_string();
-
-                parts.push(
-                    CompletedPart::builder()
-                        .part_number(part_number as i32)
-                        .e_tag(etag)
-                        .build(),
-                );
-            }
-            UploadCommand::Complete { final_data } => {
-                // Upload final part if any data remains
-                if let Some(data) = final_data {
-                    if !data.is_empty() {
-                        // Initialize upload if this is the only part
-                        if upload_id.is_none() {
-                            let response = client
-                                .create_multipart_upload()
-                                .bucket(&bucket)
-                                .key(&key)
-                                .send()
-                                .await
-                                .map_err(|e| {
-                                    SZipError::Io(io::Error::other(format!(
-                                        "Failed to create multipart upload: {}",
-                                        e
-                                    )))
-                                })?;
-
-                            upload_id = Some(
-                                response
-                                    .upload_id()
-                                    .ok_or_else(|| {
-                                        SZipError::Io(io::Error::other(
-                                            "No upload_id returned from S3",
-                                        ))
-                                    })?
-                                    .to_string(),
-                            );
-                        }
-
-                        let part_number = parts.len() + 1;
-                        let response = client
-                            .upload_part()
-                            .bucket(&bucket)
-                            .key(&key)
-                            .upload_id(upload_id.as_ref().unwrap())
-                            .part_number(part_number as i32)
-                            .body(ByteStream::from(data))
-                            .send()
-                            .await
-                            .map_err(|e| {
-                                SZipError::Io(io::Error::other(format!(
-                                    "Failed to upload final part: {}",
-                                    e
-                                )))
-                            })?;
-
-                        let etag = response
-                            .e_tag()
-                            .ok_or_else(|| {
-                                SZipError::Io(io::Error::other("No ETag returned for final part"))
-                            })?
-                            .to_string();
-
-                        parts.push(
-                            CompletedPart::builder()
-                                .part_number(part_number as i32)
-                                .e_tag(etag)
-                                .build(),
-                        );
-                    }
-                }
-
-                // Complete multipart upload
-                if let Some(id) = upload_id {
-                    client
-                        .complete_multipart_upload()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .upload_id(&id)
-                        .multipart_upload(
-                            CompletedMultipartUpload::builder()
-                                .set_parts(Some(parts))
-                                .build(),
-                        )
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            SZipError::Io(io::Error::other(format!(
-                                "Failed to complete multipart upload: {}",
-                                e
-                            )))
-                        })?;
-                }
-
-                break;
-            }
-        }
-    }
-
-    Ok(())
+fn upload_task_gone() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "Upload task terminated unexpectedly",
+    )
 }
 
 /// Concurrent upload worker with retry logic and parallel uploads
 ///
-/// This version uploads multiple parts in parallel for 3-5x faster S3 uploads.
-/// Includes automatic retry with exponential backoff for transient failures.
+/// Uploads up to `max_concurrent` parts in parallel and only accepts a new part
+/// from the writer when a slot is free, which (together with the bounded
+/// channel) gives the writer backpressure. Includes automatic retry with
+/// exponential backoff for transient failures. If the writer is dropped before
+/// `finish()`, the multipart upload is aborted so no orphaned parts remain.
 async fn upload_worker_concurrent(
     client: Client,
     bucket: String,
     key: String,
-    mut rx: mpsc::UnboundedReceiver<UploadCommand>,
+    mut rx: mpsc::Receiver<UploadCommand>,
     max_concurrent: usize,
 ) -> Result<()> {
     use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -674,162 +510,130 @@ async fn upload_worker_concurrent(
     let mut upload_id: Option<String> = None;
     let mut completed_parts: Vec<(usize, CompletedPart)> = Vec::new();
     let mut upload_futures = FuturesUnordered::new();
-    let mut pending_parts: Vec<(usize, Vec<u8>)> = Vec::new();
 
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            UploadCommand::UploadPart { part_number, data } => {
-                // Initialize multipart upload if first part
-                if upload_id.is_none() {
-                    let response = client
-                        .create_multipart_upload()
-                        .bucket(bucket.as_ref())
-                        .key(key.as_ref())
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            SZipError::Io(io::Error::other(format!(
-                                "Failed to create multipart upload: {}",
-                                e
-                            )))
-                        })?;
-
-                    upload_id = Some(
-                        response
-                            .upload_id()
-                            .ok_or_else(|| {
-                                SZipError::Io(io::Error::other("No upload_id returned from S3"))
-                            })?
-                            .to_string(),
-                    );
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                Some(result) = upload_futures.next(), if !upload_futures.is_empty() => {
+                    completed_parts.push(result?);
                 }
-
-                let upload_id_clone = upload_id.clone().unwrap();
-
-                // Add to pending or start upload immediately
-                if upload_futures.len() < max_concurrent {
-                    // Start upload immediately
-                    let fut = upload_part_with_retry(
-                        client.clone(),
-                        bucket.clone(),
-                        key.clone(),
-                        upload_id_clone,
-                        part_number,
-                        data,
-                    );
-                    upload_futures.push(fut);
-                } else {
-                    // Queue for later
-                    pending_parts.push((part_number, data));
-                }
-
-                // Poll for completed uploads
-                while let Some(result) = upload_futures.next().await {
-                    let (part_num, completed_part) = result?;
-                    completed_parts.push((part_num, completed_part));
-
-                    // Start next pending upload if any
-                    if let Some((pn, pdata)) = pending_parts.pop() {
-                        let fut = upload_part_with_retry(
-                            client.clone(),
-                            bucket.clone(),
-                            key.clone(),
-                            upload_id.clone().unwrap(),
-                            pn,
-                            pdata,
-                        );
-                        upload_futures.push(fut);
-                    }
-
-                    // Break if we haven't reached max concurrent yet
-                    if upload_futures.len() < max_concurrent {
-                        break;
-                    }
-                }
-            }
-            UploadCommand::Complete { final_data } => {
-                // Upload final part if any data remains
-                if let Some(data) = final_data {
-                    if !data.is_empty() {
-                        // Initialize upload if this is the only part
-                        if upload_id.is_none() {
-                            let response = client
-                                .create_multipart_upload()
-                                .bucket(bucket.as_ref())
-                                .key(key.as_ref())
-                                .send()
-                                .await
-                                .map_err(|e| {
-                                    SZipError::Io(io::Error::other(format!(
-                                        "Failed to create multipart upload: {}",
-                                        e
-                                    )))
-                                })?;
-
-                            upload_id = Some(
-                                response
-                                    .upload_id()
-                                    .ok_or_else(|| {
-                                        SZipError::Io(io::Error::other(
-                                            "No upload_id returned from S3",
-                                        ))
-                                    })?
-                                    .to_string(),
-                            );
+                cmd = rx.recv(), if upload_futures.len() < max_concurrent => {
+                    match cmd {
+                        Some(UploadCommand::UploadPart { part_number, data }) => {
+                            let id = ensure_multipart_upload(&client, &bucket, &key, &mut upload_id).await?;
+                            upload_futures.push(upload_part_with_retry(
+                                client.clone(),
+                                bucket.clone(),
+                                key.clone(),
+                                id,
+                                part_number,
+                                data,
+                            ));
                         }
+                        Some(UploadCommand::Complete { final_data }) => {
+                            if let Some(data) = final_data.filter(|d| !d.is_empty()) {
+                                let id = ensure_multipart_upload(&client, &bucket, &key, &mut upload_id).await?;
+                                let part_number = completed_parts.len() + upload_futures.len() + 1;
+                                upload_futures.push(upload_part_with_retry(
+                                    client.clone(),
+                                    bucket.clone(),
+                                    key.clone(),
+                                    id,
+                                    part_number,
+                                    data,
+                                ));
+                            }
 
-                        let part_number =
-                            completed_parts.len() + upload_futures.len() + pending_parts.len() + 1;
-                        let fut = upload_part_with_retry(
-                            client.clone(),
-                            bucket.clone(),
-                            key.clone(),
-                            upload_id.clone().unwrap(),
-                            part_number,
-                            data,
-                        );
-                        upload_futures.push(fut);
+                            // Wait for all remaining uploads to complete
+                            while let Some(result) = upload_futures.next().await {
+                                completed_parts.push(result?);
+                            }
+
+                            // Sort parts by part number (S3 requires sequential order)
+                            completed_parts.sort_by_key(|(part_num, _)| *part_num);
+                            let parts: Vec<_> =
+                                std::mem::take(&mut completed_parts).into_iter().map(|(_, p)| p).collect();
+
+                            // Complete multipart upload
+                            if let Some(id) = upload_id.take() {
+                                client
+                                    .complete_multipart_upload()
+                                    .bucket(bucket.as_ref())
+                                    .key(key.as_ref())
+                                    .upload_id(&id)
+                                    .multipart_upload(
+                                        CompletedMultipartUpload::builder()
+                                            .set_parts(Some(parts))
+                                            .build(),
+                                    )
+                                    .send()
+                                    .await
+                                    .map_err(|e| {
+                                        SZipError::Io(io::Error::other(format!(
+                                            "Failed to complete multipart upload: {}",
+                                            e
+                                        )))
+                                    })?;
+                            }
+                            return Ok(());
+                        }
+                        // Writer dropped before finish()
+                        None => {
+                            return Err(SZipError::Io(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "S3 writer dropped before finish()",
+                            )));
+                        }
                     }
                 }
-
-                // Wait for all remaining uploads to complete
-                while let Some(result) = upload_futures.next().await {
-                    let (part_num, completed_part) = result?;
-                    completed_parts.push((part_num, completed_part));
-                }
-
-                // Sort parts by part number (S3 requires sequential order)
-                completed_parts.sort_by_key(|(part_num, _)| *part_num);
-                let parts: Vec<_> = completed_parts.into_iter().map(|(_, p)| p).collect();
-
-                // Complete multipart upload
-                if let Some(id) = upload_id {
-                    client
-                        .complete_multipart_upload()
-                        .bucket(bucket.as_ref())
-                        .key(key.as_ref())
-                        .upload_id(&id)
-                        .multipart_upload(
-                            CompletedMultipartUpload::builder()
-                                .set_parts(Some(parts))
-                                .build(),
-                        )
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            SZipError::Io(io::Error::other(format!(
-                                "Failed to complete multipart upload: {}",
-                                e
-                            )))
-                        })?;
-                }
-
-                break;
             }
         }
     }
+    .await;
 
-    Ok(())
+    // On any failure, abort the multipart upload so S3 does not keep (and bill) orphaned parts
+    if result.is_err() {
+        if let Some(id) = upload_id {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket.as_ref())
+                .key(key.as_ref())
+                .upload_id(id)
+                .send()
+                .await;
+        }
+    }
+    result
+}
+
+/// Start the multipart upload on first use and return its id.
+async fn ensure_multipart_upload(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &mut Option<String>,
+) -> Result<String> {
+    if let Some(id) = upload_id {
+        return Ok(id.clone());
+    }
+    let response = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| {
+            SZipError::Io(io::Error::other(format!(
+                "Failed to create multipart upload: {}",
+                e
+            )))
+        })?;
+    let id = response
+        .upload_id()
+        .ok_or_else(|| SZipError::Io(io::Error::other("No upload_id returned from S3")))?
+        .to_string();
+    *upload_id = Some(id.clone());
+    Ok(id)
 }
 
 /// Upload a single part with exponential backoff retry
@@ -893,10 +697,7 @@ async fn upload_part_with_retry(
 
 impl Drop for S3ZipWriter {
     fn drop(&mut self) {
-        // If the writer is dropped without calling finish(), we should try to abort
-        // the multipart upload to avoid orphaned parts
-        // However, we can't easily abort from Drop since it's not async
-        // Users should ensure finish() is called properly
+        // Dropping the sender makes the upload task abort the multipart upload
     }
 }
 
@@ -1241,3 +1042,45 @@ impl Unpin for S3ZipReader {}
 // `Send` remains enforced even if a future field addition would otherwise make
 // it non-obvious to the compiler (e.g. behind another `dyn Trait`).
 unsafe impl Send for S3ZipReader {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn test_writer_applies_backpressure() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut writer = S3ZipWriter {
+            upload_tx: PollSender::new(tx),
+            upload_task: None,
+            buffer: Vec::new(),
+            part_size: 4,
+            position: 0,
+            current_part_number: 0,
+            shutdown_initiated: false,
+            max_concurrent_uploads: 1,
+        };
+
+        // Nobody drains the channel: after one queued part the writer must stall
+        let data = [0u8; 4];
+        let mut task = tokio_test::task::spawn(async {
+            for _ in 0..4 {
+                writer.write_all(&data).await.unwrap();
+            }
+        });
+        assert!(task.poll().is_pending());
+
+        // Draining one part lets the writer make progress again
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UploadCommand::UploadPart { part_number: 1, .. })
+        ));
+        assert!(task.is_woken());
+        assert!(task.poll().is_pending());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UploadCommand::UploadPart { part_number: 2, .. })
+        ));
+    }
+}
